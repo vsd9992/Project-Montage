@@ -1,0 +1,20 @@
+# Direct dependencies of src/*.py. Versions are the ones this project was built and
+# verified against; newer minor/patch versions will very likely work too.
+#
+# NOT included here: torch / transformers / accelerate / safetensors / tokenizers.
+# models/siglip2 was downloaded during early planning (see README's "Implementation
+# notes / deviations from the original plan") but no pipeline stage currently uses it --
+# burst/duplicate detection uses perceptual hashing (ImageHash) instead. Install those
+# extra packages yourself only if you wire SigLIP2 (or another transformers-based model)
+# into a stage.
+pillow==12.3.0
+opencv-python==5.0.0.93
+ImageHash==4.3.2
+insightface==1.0.1
+onnxruntime==1.29.0
+numpy==2.5.2
+requests==2.34.2
+
+# insightface's ONNX models run fine on onnxruntime (CPU). For GPU-accelerated face
+# detection, replace onnxruntime with onnxruntime-gpu (requires a matching CUDA/cuDNN
+# install) -- see README's "Models" section.

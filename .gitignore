@@ -1,0 +1,30 @@
+# Personal working data -- never pushed. Each project run regenerates these locally.
+cache/
+exports/
+data/
+src/cache/
+
+# AI model weights -- too large for git; see README's "Models" section for download
+# links and where to place them.
+models/
+src/models/
+
+# AI-agent project memory / workspace -- local working notes, not project documentation.
+.ai/
+.claude/
+
+# Design/mockup exploration artifacts -- not part of the shipped app.
+design/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
