@@ -265,13 +265,18 @@ resumable script, and keep layout geometry and visual style decoupled (see
 
 ## License
 
-Licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0) — see
-[`LICENSE`](LICENSE) for the full text. In short: you're free to use, study, modify, and
-share this project, including running it as part of your own workflow or service — but
-if you modify it and distribute that modified version, or run a modified version as a
-network service others interact with, you must make your modified source code available
-under the same license. AGPL-3.0 does not itself prohibit commercial use; it requires
-that derivative works, however they're used, stay open under the same terms.
+Licensed under **AGPL-3.0 with the Commons Clause** — see [`LICENSE`](LICENSE) for the
+full text. In plain terms:
+
+- **Personal / non-commercial use is fully permitted**, including modifying it, running
+  your own copy, and self-hosting it for yourself.
+- **If you modify and distribute it, or run a modified version as a network service
+  others interact with, you must share your source code** under this same license (the
+  AGPL-3.0 copyleft condition).
+- **You may not sell it, or sell any product or service whose value comes substantially
+  from it** — this project or a fork of it — under the Commons Clause condition layered
+  on top of AGPL-3.0. That covers selling the software itself, selling access to a
+  hosted version of it, and selling paid support/consulting built around it.
 
 ## Acknowledgments
 
