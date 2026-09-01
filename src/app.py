@@ -15,7 +15,9 @@ design) or when the spread editor's chat is first used (`spread_editor_app`'s la
 """
 
 import argparse
+import atexit
 import json
+import signal
 import threading
 import webbrowser
 from http.client import HTTPConnection
@@ -122,10 +124,15 @@ def make_router(engine_state: dict):
 def run(db_path: str, exports_dir: str, source_dir: str, spreads_path: str, crops_path: str,
         rendered_dir: str, out_pdf: str, size: str, style: str, port: int, open_browser: bool = True) -> None:
     engine_state: dict = {"state": "idle"}
+    # Shared with project_app's Dashboard screen: the print size chosen there (hard-gated
+    # before the pipeline can run, since page ratio drives spread layout) is what the
+    # editor/export screens must render/export at too -- a dict so later screens see
+    # whatever the user picked, not whatever --size this process happened to start with.
+    project_state: dict = {"source_dir": source_dir, "size": size}
 
     dashboard = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_DASHBOARD),
-        project_app.make_handler(db_path, exports_dir, {"source_dir": source_dir}),
+        project_app.make_handler(db_path, exports_dir, project_state),
     )
     people = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_PEOPLE), label_people_app.make_handler(db_path, "/people"),
@@ -136,12 +143,12 @@ def run(db_path: str, exports_dir: str, source_dir: str, spreads_path: str, crop
     )
     editor = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_EDITOR),
-        spread_editor_app.make_handler(db_path, spreads_path, crops_path, rendered_dir, size, style,
+        spread_editor_app.make_handler(db_path, spreads_path, crops_path, rendered_dir, project_state, style,
                                         "/editor", engine_state),
     )
     export = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_EXPORT),
-        export_app.make_handler(rendered_dir, spreads_path, out_pdf, size, style, "/export"),
+        export_app.make_handler(rendered_dir, spreads_path, db_path, exports_dir, project_state, style, "/export"),
     )
 
     for s in (dashboard, people, storyboard, editor, export):
@@ -149,22 +156,52 @@ def run(db_path: str, exports_dir: str, source_dir: str, spreads_path: str, crop
 
     router = ThreadingHTTPServer(("127.0.0.1", port), make_router(engine_state))
     url = f"http://127.0.0.1:{port}/"
+
+    _shutdown_done = {"done": False}
+
+    def _shutdown_everything():
+        # Registered under atexit AND as the SIGINT/SIGTERM handler so the AI engine
+        # subprocess is killed on every exit path -- plain Ctrl+C (KeyboardInterrupt via
+        # serve_forever's select loop), a second Ctrl+C while a stage subprocess has
+        # temporarily grabbed the console's SIGINT, or an external `taskkill`/service stop
+        # sending SIGTERM -- not just the one happy path this previously only handled.
+        if _shutdown_done["done"]:
+            return
+        _shutdown_done["done"] = True
+        for s in (router, dashboard, people, storyboard, editor, export):
+            try:
+                s.server_close()
+            except Exception:
+                pass
+        editor_handler_llama_proc = editor.RequestHandlerClass.llama_proc["proc"] \
+            if hasattr(editor.RequestHandlerClass, "llama_proc") else None
+        if editor_handler_llama_proc is not None and editor_handler_llama_proc.poll() is None:
+            from qwen_stage import stop_server
+            print("Stopping AI engine...")
+            stop_server(editor_handler_llama_proc)
+        from project_app import _terminate_current
+        _terminate_current()
+
+    atexit.register(_shutdown_everything)
+
+    def _on_signal(signum, frame):
+        print(f"\nReceived signal {signum}, shutting down Album Studio and the AI engine...")
+        _shutdown_everything()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
     print(f"Album Studio running at {url}")
+    print("Press Ctrl+C to stop the server and shut down the AI engine (if running).")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         router.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
-        for s in (router, dashboard, people, storyboard, editor, export):
-            s.server_close()
-        editor_handler_llama_proc = editor.RequestHandlerClass.llama_proc["proc"] \
-            if hasattr(editor.RequestHandlerClass, "llama_proc") else None
-        if editor_handler_llama_proc is not None:
-            from qwen_stage import stop_server
-            print("Stopping AI engine...")
-            stop_server(editor_handler_llama_proc)
+        _shutdown_everything()
 
 
 if __name__ == "__main__":

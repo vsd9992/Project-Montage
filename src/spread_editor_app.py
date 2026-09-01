@@ -29,7 +29,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 import web_theme
-from conversation_stage import propose_edits
+from conversation_stage import candidate_pool, propose_edits
 from crop_stage import compute_crop
 from db import connect
 from layout_geometry import DEFAULT_SIZE, get_geometry
@@ -167,10 +167,8 @@ def _render_detail(spreads_path: str, spread_number: int, mount: str) -> bytes |
           <img src="{mount}/slot_thumb/{spread_number}/{urllib.parse.quote(slot)}">
           <div>
             <div><strong>{html.escape(slot)}</strong></div>
-            <form method="post" action="{mount}/spread/{spread_number}/slot/{urllib.parse.quote(slot)}">
-              <input type="text" name="filename" value="{filename}" {'disabled' if locked else ''}>
-              <button type="submit" class="btn btn-outline" {'disabled' if locked else ''}>Swap</button>
-            </form>
+            <div style="font-size:11.5px;color:var(--text-faint);max-width:14em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{filename}</div>
+            <button type="button" class="btn btn-outline swap-btn" data-slot="{html.escape(slot)}" {'disabled' if locked else ''}>Swap&hellip;</button>
           </div>
         </div>""")
     lock_label = "Unlock" if locked else "Lock"
@@ -189,6 +187,16 @@ a.back { display: inline-block; margin-bottom: 1em; font-size: 12.5px; color: va
 .chat .hint { font-size: 0.85em; color: var(--text-faint); }
 #chatStatus { margin-top: 0.5em; color: var(--emerald-strong); font-weight: 600; }
 #chatProposal ul { padding-left: 1.2em; }
+#pickerOverlay { display:none; position:fixed; inset:0; background:oklch(20% 0.01 255 / 0.55); z-index:50;
+                 align-items:center; justify-content:center; }
+#pickerOverlay.show { display:flex; }
+#pickerModal { background:var(--bg); border-radius:14px; padding:20px 22px; max-width:640px; width:90%;
+               max-height:80vh; overflow-y:auto; border:1px solid var(--border); }
+#pickerGrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:10px; margin-top:12px; }
+.pick-card { cursor:pointer; border:2px solid transparent; border-radius:8px; padding:4px; text-align:center; background:none; }
+.pick-card:hover { border-color:var(--royal); }
+.pick-card img { width:100%; height:80px; object-fit:cover; border-radius:6px; }
+.pick-card div { font-size:10.5px; color:var(--text-faint); margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 </style>"""
     body = f"""
 <a class="back" href="{mount}/">&larr; All spreads</a>
@@ -216,6 +224,15 @@ a.back { display: inline-block; margin-bottom: 1em; font-size: 12.5px; color: va
   </form>
   <div id="chatStatus"></div>
   <div id="chatProposal"></div>
+</div>
+<div id="pickerOverlay">
+  <div id="pickerModal">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <strong style="font-size:14px;">Choose a photo for <span id="pickerSlotName"></span></strong>
+      <button type="button" class="btn btn-outline" id="pickerCloseBtn">Close</button>
+    </div>
+    <div id="pickerGrid">Loading&hellip;</div>
+  </div>
 </div>"""
     extra_script = ("""
 const chatForm = document.getElementById('chatForm');
@@ -262,6 +279,39 @@ if (btn) {{
     }});
   }});
 }}
+
+const pickerOverlay = document.getElementById('pickerOverlay');
+const pickerGrid = document.getElementById('pickerGrid');
+document.querySelectorAll('.swap-btn').forEach(swapBtn => {{
+  swapBtn.addEventListener('click', () => {{
+    const slot = swapBtn.dataset.slot;
+    document.getElementById('pickerSlotName').textContent = slot;
+    pickerGrid.innerHTML = 'Loading&hellip;';
+    pickerOverlay.classList.add('show');
+    fetch('{mount}/spread/{spread_number}/candidates/' + encodeURIComponent(slot)).then(r => r.json()).then(data => {{
+      if (!data.candidates || data.candidates.length === 0) {{
+        pickerGrid.innerHTML = '<p style="grid-column:1/-1;color:var(--text-faint);font-size:12.5px;">No other same-event photos available to swap in.</p>';
+        return;
+      }}
+      pickerGrid.innerHTML = data.candidates.map(c =>
+        '<button type="button" class="pick-card" data-filename="' + c.filename + '">' +
+        '<img src="{mount}/photo_thumb/' + encodeURIComponent(c.filename) + '" loading="lazy">' +
+        '<div>' + (c.event_tag || '') + '</div></button>'
+      ).join('');
+      pickerGrid.querySelectorAll('.pick-card').forEach(card => {{
+        card.addEventListener('click', () => {{
+          const fd = new URLSearchParams();
+          fd.set('filename', card.dataset.filename);
+          fetch('{mount}/spread/{spread_number}/slot/' + encodeURIComponent(slot), {{
+            method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}, body: fd.toString(),
+          }}).then(() => location.reload());
+        }});
+      }});
+    }});
+  }});
+}});
+document.getElementById('pickerCloseBtn').addEventListener('click', () => pickerOverlay.classList.remove('show'));
+pickerOverlay.addEventListener('click', (e) => {{ if (e.target === pickerOverlay) pickerOverlay.classList.remove('show'); }});
 """)
     return web_theme.page_shell(
         "/editor/", f"Spread {spread_number}", f"{spread.get('layout')} &middot; {'locked' if locked else 'unlocked'}",
@@ -282,8 +332,14 @@ def _photo_jpeg(conn: sqlite3.Connection, path: str, box: tuple | None = None) -
     return buf.getvalue()
 
 
-def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str, size: str, style: str,
+def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str, size, style: str,
                   mount: str = "", engine_state: dict | None = None):
+    # `size` is either a plain print-size string, or the project-wide state dict shared
+    # with project_app's Dashboard (app.py wires it that way) so a size chosen there after
+    # this handler was constructed is still picked up -- resolved fresh on every use.
+    def _size() -> str:
+        return (size.get("size") or DEFAULT_SIZE) if isinstance(size, dict) else size
+
     # Lazily started on first chat request, kept running for the process lifetime -- one
     # model load per editing session rather than per request (idea §21 load/batch/unload).
     # engine_state (shared with app.py's /api/engine-status) tracks idle/loading/ready so
@@ -299,6 +355,16 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                 llama_proc["proc"] = start_server()
             finally:
                 engine_state["state"] = "ready" if llama_proc["proc"] is not None else "idle"
+
+    def _release_llama_server():
+        # Shut down right after use rather than keeping it resident for the rest of the
+        # session, per user request (2026-09-01): the model was staying loaded/using
+        # memory long after the chat reply came back.
+        proc = llama_proc["proc"]
+        if proc is not None:
+            llama_proc["proc"] = None
+            engine_state["state"] = "idle"
+            stop_server(proc)
 
     _llama_proc_ref = llama_proc
 
@@ -321,7 +387,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
             if path == "/":
                 self._send_bytes(_render_grid(spreads_path, mount), "text/html; charset=utf-8")
                 return
-            if path.startswith("/spread/"):
+            if path.startswith("/spread/") and "/candidates/" not in path:
                 try:
                     n = int(path.rsplit("/", 1)[-1])
                 except ValueError:
@@ -366,6 +432,36 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                     self.send_response(404); self.end_headers(); return
                 self._send_bytes(jpeg, "image/jpeg")
                 return
+            if path.startswith("/photo_thumb/"):
+                filename = urllib.parse.unquote(path[len("/photo_thumb/"):])
+                conn = connect(db_path)
+                try:
+                    row = conn.execute("SELECT path FROM photos WHERE filename = ?", (filename,)).fetchone()
+                    jpeg = _photo_jpeg(conn, row[0]) if row else None
+                finally:
+                    conn.close()
+                if jpeg is None:
+                    self.send_response(404); self.end_headers(); return
+                self._send_bytes(jpeg, "image/jpeg")
+                return
+            if path.startswith("/spread/") and "/candidates/" in path:
+                parts = path.split("/")
+                try:
+                    n = int(parts[2])
+                    slot = urllib.parse.unquote(parts[4])
+                except (IndexError, ValueError):
+                    self.send_response(400); self.end_headers(); return
+                spreads = _load_json(spreads_path)
+                spread = next((s for s in spreads if s["spread"] == n), None)
+                if spread is None or slot not in spread["slots"]:
+                    self.send_response(404); self.end_headers(); return
+                conn = connect(db_path)
+                try:
+                    candidates = candidate_pool(conn, spread, limit=60)
+                finally:
+                    conn.close()
+                self._send_bytes(json.dumps({"candidates": candidates}).encode("utf-8"), "application/json")
+                return
             if path.startswith("/slot_thumb/"):
                 parts = path.split("/")
                 try:
@@ -408,7 +504,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                         if spread.get("locked", False):
                             skipped += 1
                             continue
-                        _regenerate_spread(conn, spread, crops_all, out_dir, size, style)
+                        _regenerate_spread(conn, spread, crops_all, out_dir, _size(), style)
                         regenerated += 1
                 finally:
                     conn.close()
@@ -484,6 +580,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                         ops = propose_edits(conn, spread, instruction)
                     finally:
                         conn.close()
+                        _release_llama_server()
                     self._send_bytes(json.dumps({"ops": ops}).encode("utf-8"), "application/json")
                     return
 
@@ -529,7 +626,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                     crops_all = _load_json(crops_path) if Path(crops_path).exists() else []
                     conn = connect(db_path)
                     try:
-                        _regenerate_spread(conn, spread, crops_all, out_dir, size, style)
+                        _regenerate_spread(conn, spread, crops_all, out_dir, _size(), style)
                     finally:
                         conn.close()
                     _save_json(crops_path, crops_all)

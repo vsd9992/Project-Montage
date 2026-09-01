@@ -37,6 +37,7 @@ from pathlib import Path
 
 import web_theme
 from db import connect
+from layout_geometry import PRINT_SIZES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -54,17 +55,24 @@ STAGES = [
      "extra_args": ["--spreads", "{exports}/spreads.json"]},
     {"key": "person_cluster", "label": "People clustering", "script": "person_cluster_stage.py"},
     {"key": "crop", "label": "Intelligent cropping", "script": "crop_stage.py",
-     "extra_args": ["--spreads", "{exports}/spreads.json", "--out", "{exports}/crops.json"]},
+     "extra_args": ["--spreads", "{exports}/spreads.json", "--out", "{exports}/crops.json", "--size", "{size}"]},
     {"key": "render", "label": "Render spreads", "script": "render_stage.py",
      "extra_args": ["--spreads", "{exports}/spreads.json", "--crops", "{exports}/crops.json",
-                     "--out-dir", "{exports}/rendered_spreads"]},
-    {"key": "export_pdf", "label": "Export PDF", "script": "export_pdf.py",
-     "extra_args": ["--rendered-dir", "{exports}/rendered_spreads", "--spreads", "{exports}/spreads.json",
-                     "--out", "{exports}/album.pdf"]},
+                     "--out-dir", "{exports}/rendered_spreads", "--size", "{size}"]},
 ]
 STAGE_BY_KEY = {s["key"]: s for s in STAGES}
 STAGE_KEYS = [s["key"] for s in STAGES]
 MAX_LOG_LINES = 300
+
+# Chain checkpoints (per user decision, 2026-09-01): the chain must not run straight
+# through to a finished album unattended -- it pauses after these stages so the user can
+# review/adjust in the corresponding screen before continuing. Export is never part of the
+# auto-chain at all; it's a separate manual action on the Export screen.
+CHECKPOINTS = {
+    "spread": {"route": "/storyboard/", "label": "Review the storyboard (spread order/grouping)"},
+    "person_cluster": {"route": "/people/", "label": "Review and label people"},
+    "render": {"route": "/editor/", "label": "Review rendered spreads, then export manually"},
+}
 
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict] = {}  # key -> {"running", "returncode", "lines", "started_at", "interrupted"}
@@ -80,6 +88,7 @@ _chain_state = {
     "failed_key": None,
     "pause_requested": False,
     "stop_requested": False,
+    "checkpoint_key": None,   # set when the chain auto-paused at a review checkpoint
 }
 
 
@@ -107,23 +116,23 @@ def _project_status(db_path: str, exports_dir: str) -> dict:
     return status
 
 
-def _build_args(stage: dict, db_path: str, exports_dir: str, source_dir: str) -> list[str]:
+def _build_args(stage: dict, db_path: str, exports_dir: str, source_dir: str, size: str) -> list[str]:
     args = []
     if stage.get("needs_source_dir"):
         args.append(source_dir)
     args += ["--db", db_path]
     for a in stage.get("extra_args", []):
-        args.append(a.replace("{exports}", exports_dir))
+        args.append(a.replace("{exports}", exports_dir).replace("{size}", size))
     return args
 
 
-def _run_stage_blocking(key: str, db_path: str, exports_dir: str, source_dir: str) -> int:
+def _run_stage_blocking(key: str, db_path: str, exports_dir: str, source_dir: str, size: str) -> int:
     """Runs one stage to completion (or until terminated by pause/stop), updating _jobs
     and _current_proc live. Returns the process return code (negative if terminated)."""
     stage = STAGE_BY_KEY[key]
     Path(exports_dir).mkdir(parents=True, exist_ok=True)
     script_path = SRC_DIR / stage["script"]
-    args = _build_args(stage, db_path, exports_dir, source_dir)
+    args = _build_args(stage, db_path, exports_dir, source_dir, size)
     cmd = [sys.executable, str(script_path), *args]
 
     with _jobs_lock:
@@ -192,21 +201,23 @@ def _wipe_project(db_path: str, exports_dir: str) -> None:
         _jobs.clear()
 
 
-def _run_chain(db_path: str, exports_dir: str, source_dir: str) -> None:
+def _run_chain(db_path: str, exports_dir: str, source_dir: str, size: str) -> None:
     with _chain_lock:
         _chain_state["running"] = True
         _chain_state["finished"] = False
         _chain_state["failed_key"] = None
+        _chain_state["checkpoint_key"] = None
         start_index = _chain_state["current_index"]
 
     idx = start_index
+    hit_checkpoint = False
     while idx < len(STAGE_KEYS):
         with _chain_lock:
             if _chain_state["stop_requested"] or _chain_state["pause_requested"]:
                 break
             _chain_state["current_index"] = idx
         key = STAGE_KEYS[idx]
-        rc = _run_stage_blocking(key, db_path, exports_dir, source_dir)
+        rc = _run_stage_blocking(key, db_path, exports_dir, source_dir, size)
 
         with _chain_lock:
             stop = _chain_state["stop_requested"]
@@ -218,12 +229,18 @@ def _run_chain(db_path: str, exports_dir: str, source_dir: str) -> None:
                 _chain_state["failed_key"] = key
             break
         idx += 1
+        if key in CHECKPOINTS:
+            hit_checkpoint = True
+            with _chain_lock:
+                _chain_state["current_index"] = idx
+                _chain_state["checkpoint_key"] = key
+            break
 
     with _chain_lock:
         stop = _chain_state["stop_requested"]
         pause = _chain_state["pause_requested"]
         _chain_state["running"] = False
-        if not stop and not pause and _chain_state["failed_key"] is None:
+        if not stop and not pause and not hit_checkpoint and _chain_state["failed_key"] is None:
             _chain_state["current_index"] = len(STAGE_KEYS)
             _chain_state["finished"] = True
         _chain_state["pause_requested"] = False
@@ -237,7 +254,7 @@ def _run_chain(db_path: str, exports_dir: str, source_dir: str) -> None:
             _chain_state["stop_requested"] = False
 
 
-def _render_index(db_path: str, exports_dir: str, source_dir: str) -> bytes:
+def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str) -> bytes:
     status = _project_status(db_path, exports_dir)
     with _chain_lock:
         chain = dict(_chain_state)
@@ -264,7 +281,6 @@ def _render_index(db_path: str, exports_dir: str, source_dir: str) -> bytes:
             <span class="badge {badge}" data-badge>{badge}</span>
             <strong>{i + 1}. {html.escape(stage['label'])}</strong>
             <code>{html.escape(stage['script'])}</code>
-            <button data-run="{stage['key']}" {'disabled' if running else ''}>Run</button>
           </div>
           <pre class="log" data-log></pre>
         </div>""")
@@ -308,18 +324,27 @@ form.config input[type=text]{flex:1;min-width:220px;}
 <div class="card stat-tile"><div class="stat-value">{'&#10003;' if status.get('album_pdf') else '&mdash;'}</div><div class="stat-label">Album PDF</div></div>
 </div>
 
-<form class="config card" style="padding:14px 18px;" method="get" action="/">
+<form class="config card" style="padding:14px 18px;" id="sourceForm">
   <label style="font-size:12.5px;color:var(--text-muted);">Source photo directory (used by Import):</label>
-  <input type="text" name="source_dir" value="{html.escape(source_dir)}" placeholder="D:\\path\\to\\event\\photos">
-  <button type="submit" class="btn btn-outline">Choose Folder</button>
+  <input type="text" id="sourceInput" name="source_dir" value="{html.escape(source_dir)}" placeholder="D:\\path\\to\\event\\photos">
+  <button type="button" id="chooseFolderBtn" class="btn btn-outline">Choose Folder&hellip;</button>
+</form>
+
+<form class="config card" style="padding:14px 18px;">
+  <label style="font-size:12.5px;color:var(--text-muted);">Print size (page ratio drives layout &mdash; choose before starting):</label>
+  <select id="sizeSelect">
+    <option value="" {'selected' if not size else ''} disabled>-- choose a size --</option>
+    {''.join(f'<option value="{s}" {"selected" if s == size else ""}>{s} in</option>' for s in PRINT_SIZES)}
+  </select>
 </form>
 
 <div class="chain-controls">
-  <button id="startBtn" class="btn btn-primary">Start / Resume Pipeline</button>
+  <button id="startBtn" class="btn btn-primary" {'disabled' if not size else ''}>Start / Resume Pipeline</button>
   <button id="pauseBtn" class="btn btn-outline">Pause</button>
   <button id="stopBtn" class="btn btn-danger">Stop &amp; Clear Project</button>
   <span id="chainText" style="font-size:12.5px;color:var(--text-muted);"></span>
 </div>
+<div id="checkpointBanner" style="display:none;padding:12px 16px;border-radius:10px;background:var(--brown-soft);border:1px solid var(--brown);font-size:12.5px;font-weight:600;margin-top:4px;"></div>
 
 <div>
 <div class="section-title" style="margin-bottom:10px;">Pipeline stages</div>
@@ -335,7 +360,6 @@ function poll() {
       if (!el) continue;
       const badgeEl = el.querySelector('[data-badge]');
       const logEl = el.querySelector('[data-log]');
-      const btn = el.querySelector('[data-run]');
       const job = jobs[key];
       let badge = 'idle';
       if (job.running) badge = 'running';
@@ -344,7 +368,6 @@ function poll() {
       else if (job.returncode !== null) badge = 'failed';
       badgeEl.textContent = badge;
       badgeEl.className = 'badge ' + badge;
-      btn.disabled = job.running;
       if (job.lines && job.lines.length) {
         logEl.textContent = job.lines.join('\\n');
         logEl.classList.add('show');
@@ -375,16 +398,19 @@ function poll() {
     else if (chain.current_index > 0) chainText.textContent = 'Paused at stage ' + (chain.current_index + 1) + '.';
     else chainText.textContent = '';
 
-    document.getElementById('startBtn').disabled = chain.running;
+    const checkpointBanner = document.getElementById('checkpointBanner');
+    if (!chain.running && chain.checkpoint_key && chain.checkpoint_route) {
+      checkpointBanner.innerHTML = chain.checkpoint_label + ' &mdash; <a href="' + chain.checkpoint_route + '">open that screen</a>, then come back and click Start to continue.';
+      checkpointBanner.style.display = 'block';
+    } else {
+      checkpointBanner.style.display = 'none';
+    }
+
+    const sizeChosen = !!document.getElementById('sizeSelect').value;
+    document.getElementById('startBtn').disabled = chain.running || !sizeChosen;
     document.getElementById('pauseBtn').disabled = !chain.running;
   });
 }
-document.querySelectorAll('[data-run]').forEach(btn => {
-  btn.addEventListener('click', () => {
-    btn.disabled = true;
-    fetch('/run/' + btn.dataset.run, {method: 'POST'});
-  });
-});
 document.getElementById('startBtn').addEventListener('click', () => {
   fetch('/chain/start', {method: 'POST'});
 });
@@ -394,6 +420,24 @@ document.getElementById('pauseBtn').addEventListener('click', () => {
 document.getElementById('stopBtn').addEventListener('click', () => {
   if (!confirm('Stop will permanently DELETE the project database and all exports (photos on disk are untouched). Continue?')) return;
   fetch('/chain/stop', {method: 'POST'}).then(() => location.reload());
+});
+document.getElementById('chooseFolderBtn').addEventListener('click', () => {
+  const btn = document.getElementById('chooseFolderBtn');
+  btn.disabled = true;
+  btn.textContent = 'Waiting for dialog...';
+  fetch('/pick-folder', {method: 'POST'}).then(r => r.json()).then(data => {
+    btn.disabled = false;
+    btn.textContent = 'Choose Folder\\u2026';
+    if (data.path) document.getElementById('sourceInput').value = data.path;
+  }).catch(() => { btn.disabled = false; btn.textContent = 'Choose Folder\\u2026'; });
+});
+document.getElementById('sourceInput').addEventListener('change', () => {
+  fetch('/set-source-dir?source_dir=' + encodeURIComponent(document.getElementById('sourceInput').value), {method: 'POST'});
+});
+document.getElementById('sizeSelect').addEventListener('change', (e) => {
+  fetch('/set-size?size=' + encodeURIComponent(e.target.value), {method: 'POST'}).then(() => {
+    document.getElementById('startBtn').disabled = !e.target.value;
+  });
 });
 setInterval(poll, 1500);
 poll();
@@ -412,7 +456,7 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 qs = urllib.parse.parse_qs(parsed.query)
                 if "source_dir" in qs:
                     state["source_dir"] = qs["source_dir"][0]
-                body = _render_index(db_path, exports_dir, state["source_dir"])
+                body = _render_index(db_path, exports_dir, state["source_dir"], state.get("size", ""))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -423,6 +467,10 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                     jobs = dict(_jobs)
                 with _chain_lock:
                     chain = dict(_chain_state)
+                cp = CHECKPOINTS.get(chain.get("checkpoint_key"))
+                if cp:
+                    chain["checkpoint_route"] = cp["route"]
+                    chain["checkpoint_label"] = cp["label"]
                 body = json.dumps({"jobs": jobs, "chain": chain}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -437,6 +485,13 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
             self.send_response(202)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+        def _send_json(self, body: bytes, status: int = 200):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             parsed = urllib.parse.urlparse(self.path)
@@ -455,13 +510,54 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                     self.end_headers()
                     return
                 threading.Thread(
-                    target=_run_stage_blocking, args=(key, db_path, exports_dir, state["source_dir"]),
+                    target=_run_stage_blocking,
+                    args=(key, db_path, exports_dir, state["source_dir"], state.get("size", "")),
                     daemon=True,
                 ).start()
                 self._accept()
                 return
 
+            if path == "/set-source-dir":
+                qs = urllib.parse.parse_qs(parsed.query)
+                state["source_dir"] = qs.get("source_dir", [""])[0]
+                self._accept()
+                return
+
+            if path == "/set-size":
+                qs = urllib.parse.parse_qs(parsed.query)
+                value = qs.get("size", [""])[0]
+                if value and value not in PRINT_SIZES:
+                    self.send_response(400); self.end_headers(); return
+                state["size"] = value
+                self._accept()
+                return
+
+            if path == "/pick-folder":
+                # Native OS folder-picker dialog, since this is a local single-user desktop
+                # tool -- a browser <input type=file webkitdirectory> can't return a real
+                # absolute path, so we ask the OS directly via Tk's file dialog instead.
+                try:
+                    import tkinter
+                    from tkinter import filedialog
+                    root = tkinter.Tk()
+                    root.withdraw()
+                    root.attributes("-topmost", True)
+                    chosen = filedialog.askdirectory(
+                        initialdir=state.get("source_dir") or None, title="Choose source photo folder",
+                    )
+                    root.destroy()
+                except Exception:
+                    chosen = ""
+                if chosen:
+                    state["source_dir"] = chosen
+                body = json.dumps({"path": chosen or ""}).encode("utf-8")
+                self._send_json(body)
+                return
+
             if path == "/chain/start":
+                if not state.get("size"):
+                    self._send_json(b'{"error": "print size not chosen"}', 400)
+                    return
                 with _chain_lock:
                     if _chain_state["running"]:
                         self.send_response(409)
@@ -469,11 +565,13 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                         return
                     _chain_state["stop_requested"] = False
                     _chain_state["pause_requested"] = False
+                    _chain_state["checkpoint_key"] = None
                     if _chain_state["finished"]:
                         _chain_state["current_index"] = 0
                         _chain_state["finished"] = False
                 threading.Thread(
-                    target=_run_chain, args=(db_path, exports_dir, state["source_dir"]), daemon=True,
+                    target=_run_chain, args=(db_path, exports_dir, state["source_dir"], state["size"]),
+                    daemon=True,
                 ).start()
                 self._accept()
                 return
@@ -510,7 +608,7 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
 
 
 def run(db_path: str, exports_dir: str, source_dir: str, port: int) -> None:
-    state = {"source_dir": source_dir}
+    state = {"source_dir": source_dir, "size": ""}
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(db_path, exports_dir, state))
     print(f"Serving project pipeline UI at http://127.0.0.1:{port}/  (db: {db_path})")
     try:

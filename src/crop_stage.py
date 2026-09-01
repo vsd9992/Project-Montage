@@ -76,8 +76,11 @@ def saliency_bbox(path: str, max_dim: int = 512) -> tuple[float, float, float, f
 
 def fit_to_aspect(box, img_w: int, img_h: int, target_aspect: float,
                    margin_frac: float = 0.0) -> tuple[float, float, float, float]:
-    """Expand `box` by margin_frac, then grow it (never shrink) to hit target_aspect,
-    keeping it centred on the original box, then shift (not squash) to stay in bounds."""
+    """Expand `box` by margin_frac, then grow it (never shrink below the original box) to
+    hit target_aspect exactly, keeping it centred, then shift (not squash) to stay in
+    bounds. The returned box's aspect ratio always equals target_aspect -- callers resize
+    it directly into a slot rectangle of that same aspect, so any box whose aspect drifted
+    from target_aspect would come out squashed/stretched at render time."""
     x1, y1, x2, y2 = box
     bw, by = x2 - x1, y2 - y1
     x1 -= bw * margin_frac
@@ -89,17 +92,24 @@ def fit_to_aspect(box, img_w: int, img_h: int, target_aspect: float,
 
     box_w, box_h = x2 - x1, y2 - y1
     if box_w <= 0 or box_h <= 0:
-        return 0.0, 0.0, float(img_w), float(img_h)
+        x1, y1, x2, y2 = 0.0, 0.0, float(img_w), float(img_h)
+        box_w, box_h = float(img_w), float(img_h)
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
     cur_aspect = box_w / box_h
 
     if cur_aspect < target_aspect:
-        new_w = min(box_h * target_aspect, img_w)
-        cx = (x1 + x2) / 2
-        x1, x2 = cx - new_w / 2, cx + new_w / 2
+        ideal_w, ideal_h = box_h * target_aspect, box_h
     else:
-        new_h = min(box_w / target_aspect, img_h)
-        cy = (y1 + y2) / 2
-        y1, y2 = cy - new_h / 2, cy + new_h / 2
+        ideal_w, ideal_h = box_w, box_w / target_aspect
+
+    # Scale down (uniformly, so aspect is preserved) if the ideal box overflows the image
+    # on either axis -- capping just one axis without the other would change the aspect
+    # ratio away from target_aspect, which is exactly the bug this fixes.
+    scale = min(1.0, img_w / ideal_w, img_h / ideal_h)
+    new_w, new_h = ideal_w * scale, ideal_h * scale
+
+    x1, x2 = cx - new_w / 2, cx + new_w / 2
+    y1, y2 = cy - new_h / 2, cy + new_h / 2
 
     # Shift back into bounds (don't resize -- keep the exact target aspect ratio).
     if x1 < 0:
