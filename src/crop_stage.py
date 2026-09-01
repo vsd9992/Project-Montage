@@ -1,5 +1,5 @@
 """Intelligent cropping (idea §15): compute a safe crop region per photo, per spread slot,
-so the renderer (later work) never blindly centre-crops a photo that would cut off a face.
+so the renderer never blindly centre-crops a photo that would cut off a face.
 
 Subject region priority:
 1. Union of detected face bounding boxes (from `faces`, populated by face_stage.py) --
@@ -11,9 +11,13 @@ Subject region priority:
    OpenCV install) -- good enough to avoid dumb centre-crops on faceless photos (decor,
    venue, landscape shots).
 
-Per-slot target aspect ratios come from `layout_geometry.py` -- the same rectangles
-render_stage.py places photos into, so a crop computed here always fits its slot exactly
-with no squash/stretch at render time.
+Guaranteed-visible faces (2026-09-01, per user report of cut-off faces in the exported
+album): this stage only ever trims background *around* the subject via
+`expand_with_margin` -- it never shrinks the subject region itself, so a detected face is
+always fully contained in the crop. It also no longer forces the crop to match its slot's
+aspect ratio; `render_stage.py` now fits whatever aspect ratio comes out of here into the
+slot rect without cropping further ("contain", not "cover" -- see its docstring), so the
+whole photo is always visible.
 """
 
 import argparse
@@ -23,7 +27,7 @@ import cv2
 import numpy as np
 
 from db import connect
-from layout_geometry import DEFAULT_SIZE, get_geometry
+from layout_geometry import DEFAULT_ORIENTATION, DEFAULT_SIZE, get_geometry
 
 FACE_MARGIN_FRAC = 0.35  # padding added around the subject bbox before fitting aspect ratio
 SALIENCY_ENERGY_FRACTION = 0.6  # fraction of total gradient energy the saliency bbox must contain
@@ -74,59 +78,27 @@ def saliency_bbox(path: str, max_dim: int = 512) -> tuple[float, float, float, f
     return x1 * inv_scale, y1 * inv_scale, (x2 + 1) * inv_scale, (y2 + 1) * inv_scale
 
 
-def fit_to_aspect(box, img_w: int, img_h: int, target_aspect: float,
-                   margin_frac: float = 0.0) -> tuple[float, float, float, float]:
-    """Expand `box` by margin_frac, then grow it (never shrink below the original box) to
-    hit target_aspect exactly, keeping it centred, then shift (not squash) to stay in
-    bounds. The returned box's aspect ratio always equals target_aspect -- callers resize
-    it directly into a slot rectangle of that same aspect, so any box whose aspect drifted
-    from target_aspect would come out squashed/stretched at render time."""
+def expand_with_margin(box, img_w: int, img_h: int,
+                        margin_frac: float = 0.0) -> tuple[float, float, float, float]:
+    """Expand `box` (a subject/face region) by margin_frac and clamp to image bounds.
+    Deliberately does NOT force any target aspect ratio (changed 2026-09-01, per user
+    report of cut-off faces): the old version scaled the whole box down -- including the
+    subject itself, not just the margin -- whenever the aspect-matched box would have
+    overflowed the image, which could crop into a face that was otherwise fully framed.
+    Only the margin is ever sacrificed here; the original `box` is always fully contained
+    in the result as long as `box` itself is within the image. render_stage.py now fits
+    whatever aspect ratio comes out of this into the slot rect ("contain", not "cover"),
+    so there's no longer a reason this needs to hit an exact aspect."""
     x1, y1, x2, y2 = box
-    bw, by = x2 - x1, y2 - y1
+    bw, bh = x2 - x1, y2 - y1
     x1 -= bw * margin_frac
     x2 += bw * margin_frac
-    y1 -= by * margin_frac
-    y2 += by * margin_frac
+    y1 -= bh * margin_frac
+    y2 += bh * margin_frac
     x1, y1 = max(0.0, x1), max(0.0, y1)
     x2, y2 = min(float(img_w), x2), min(float(img_h), y2)
-
-    box_w, box_h = x2 - x1, y2 - y1
-    if box_w <= 0 or box_h <= 0:
-        x1, y1, x2, y2 = 0.0, 0.0, float(img_w), float(img_h)
-        box_w, box_h = float(img_w), float(img_h)
-    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-    cur_aspect = box_w / box_h
-
-    if cur_aspect < target_aspect:
-        ideal_w, ideal_h = box_h * target_aspect, box_h
-    else:
-        ideal_w, ideal_h = box_w, box_w / target_aspect
-
-    # Scale down (uniformly, so aspect is preserved) if the ideal box overflows the image
-    # on either axis -- capping just one axis without the other would change the aspect
-    # ratio away from target_aspect, which is exactly the bug this fixes.
-    scale = min(1.0, img_w / ideal_w, img_h / ideal_h)
-    new_w, new_h = ideal_w * scale, ideal_h * scale
-
-    x1, x2 = cx - new_w / 2, cx + new_w / 2
-    y1, y2 = cy - new_h / 2, cy + new_h / 2
-
-    # Shift back into bounds (don't resize -- keep the exact target aspect ratio).
-    if x1 < 0:
-        x2 -= x1
-        x1 = 0.0
-    if x2 > img_w:
-        x1 -= (x2 - img_w)
-        x2 = float(img_w)
-    if y1 < 0:
-        y2 -= y1
-        y1 = 0.0
-    if y2 > img_h:
-        y1 -= (y2 - img_h)
-        y2 = float(img_h)
-
-    x1, y1 = max(0.0, x1), max(0.0, y1)
-    x2, y2 = min(float(img_w), x2), min(float(img_h), y2)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0, 0.0, float(img_w), float(img_h)
     return x1, y1, x2, y2
 
 
@@ -152,7 +124,13 @@ def compute_crop(conn, filename: str, target_aspect: float) -> dict:
     ).fetchall()
 
     if faces:
-        subject_box = union_bbox(faces)
+        fx1, fy1, fx2, fy2 = union_bbox(faces)
+        face_h = fy2 - fy1
+        # insightface's bbox runs eyebrow-to-chin, not hairline-to-chin -- a *symmetric*
+        # margin around that box routinely left the top of the head/hair outside the crop
+        # (visibly cut off in the exported album, 2026-09-01). Pad well above the box to
+        # cover hair/forehead, and less below since the chin is already included.
+        subject_box = (fx1, fy1 - face_h * 0.55, fx2, fy2 + face_h * 0.15)
         source = "faces"
         margin = FACE_MARGIN_FRAC
     else:
@@ -163,7 +141,7 @@ def compute_crop(conn, filename: str, target_aspect: float) -> dict:
             subject_box = (0.0, 0.0, float(img_w), float(img_h))
             source = "full_image"
 
-    crop = fit_to_aspect(subject_box, img_w, img_h, target_aspect, margin_frac=margin)
+    crop = expand_with_margin(subject_box, img_w, img_h, margin_frac=margin)
     return {
         "filename": filename,
         "subject_source": source,
@@ -174,11 +152,12 @@ def compute_crop(conn, filename: str, target_aspect: float) -> dict:
     }
 
 
-def run(db_path: str, spreads_path: str, out_path: str, size: str = DEFAULT_SIZE) -> None:
+def run(db_path: str, spreads_path: str, out_path: str, size: str = DEFAULT_SIZE,
+        orientation: str = DEFAULT_ORIENTATION) -> None:
     with open(spreads_path, encoding="utf-8") as f:
         spreads = json.load(f)
 
-    geometry = get_geometry(size)
+    geometry = get_geometry(size, orientation)
     conn = connect(db_path)
     results = []
     for spread in spreads:
@@ -208,5 +187,6 @@ if __name__ == "__main__":
     parser.add_argument("--spreads", default="exports/spreads.json")
     parser.add_argument("--out", default="exports/crops.json")
     parser.add_argument("--size", default=DEFAULT_SIZE, help="Print size (see layout_geometry.PRINT_SIZES)")
+    parser.add_argument("--orientation", default=DEFAULT_ORIENTATION, choices=["landscape", "portrait"])
     args = parser.parse_args()
-    run(args.db, args.spreads, args.out, args.size)
+    run(args.db, args.spreads, args.out, args.size, args.orientation)

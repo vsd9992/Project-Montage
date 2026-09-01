@@ -22,7 +22,7 @@ import os
 
 from PIL import Image
 
-from layout_geometry import DEFAULT_SIZE, get_geometry
+from layout_geometry import DEFAULT_ORIENTATION, DEFAULT_SIZE, get_geometry
 
 MIN_DPI = 250  # below this, print quality is visibly soft; 300 is the design target
 
@@ -46,10 +46,11 @@ def preflight_check(image_path: str, geometry) -> dict:
     return {"path": image_path, "size": [w, h], "ok": not issues, "issues": issues}
 
 
-def run_preflight(rendered_dir: str, spreads_path: str, size: str = DEFAULT_SIZE) -> list[dict]:
+def run_preflight(rendered_dir: str, spreads_path: str, size: str = DEFAULT_SIZE,
+                   orientation: str = DEFAULT_ORIENTATION) -> list[dict]:
     with open(spreads_path, encoding="utf-8") as f:
         spreads = {s["spread"]: s for s in json.load(f)}
-    geometry = get_geometry(size)
+    geometry = get_geometry(size, orientation)
 
     results = []
     for n in sorted(spreads):
@@ -63,11 +64,11 @@ def run_preflight(rendered_dir: str, spreads_path: str, size: str = DEFAULT_SIZE
 
 
 def export_pdf(rendered_dir: str, spreads_path: str, out_pdf: str, skip_failed: bool = False,
-                size: str = DEFAULT_SIZE) -> None:
+                size: str = DEFAULT_SIZE, orientation: str = DEFAULT_ORIENTATION) -> None:
     with open(spreads_path, encoding="utf-8") as f:
         spreads = {s["spread"]: s for s in json.load(f)}
 
-    preflight = {r["path"]: r for r in run_preflight(rendered_dir, spreads_path, size)}
+    preflight = {r["path"]: r for r in run_preflight(rendered_dir, spreads_path, size, orientation)}
     failed = [r for r in preflight.values() if not r["ok"]]
     if failed and not skip_failed:
         print(f"Preflight failed for {len(failed)} spread(s):")
@@ -103,14 +104,15 @@ if __name__ == "__main__":
     parser.add_argument("--preflight-only", action="store_true", help="Run preflight checks and print a report, no PDF")
     parser.add_argument("--skip-failed", action="store_true", help="Export anyway, skipping spreads that fail preflight")
     parser.add_argument("--size", default=DEFAULT_SIZE, help="Print size (see layout_geometry.PRINT_SIZES)")
+    parser.add_argument("--orientation", default=DEFAULT_ORIENTATION, choices=["landscape", "portrait"])
     args = parser.parse_args()
 
     if args.preflight_only:
-        results = run_preflight(args.rendered_dir, args.spreads, args.size)
+        results = run_preflight(args.rendered_dir, args.spreads, args.size, args.orientation)
         n_ok = sum(1 for r in results if r["ok"])
         print(f"Preflight: {n_ok}/{len(results)} spreads passed")
         for r in results:
             if not r["ok"]:
                 print(f"  FAIL {r['path']}: {'; '.join(r['issues'])}")
     else:
-        export_pdf(args.rendered_dir, args.spreads, args.out, args.skip_failed, args.size)
+        export_pdf(args.rendered_dir, args.spreads, args.out, args.skip_failed, args.size, args.orientation)

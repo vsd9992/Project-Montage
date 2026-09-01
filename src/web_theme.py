@@ -1,39 +1,56 @@
 """Shared light theme + page chrome for the consolidated Album Studio web app.
 
 Every section (dashboard/people/storyboard/editor/export -- see `app.py`) renders its own
-content HTML and hands it to `page_shell()`, which wraps it in the same sidebar nav, top
-bar, and stylesheet, so the app reads as one product instead of four separate tools glued
-together. Palette (user-specified 2026-09-01): emerald green, royal blue, ivory/white,
+content HTML and hands it to `page_shell()`, which wraps it in the same step chrome, top
+bar, and stylesheet, so the app reads as one guided workflow instead of five separate tools
+glued together. Palette (user-specified 2026-09-01): emerald green, royal blue, ivory/white,
 slate gray, earth brown -- assigned below to a light, high-contrast, readable UI:
-emerald as the primary action/active-nav color, royal blue for informational/"in
+emerald as the primary action/active-step color, royal blue for informational/"in
 progress" states, slate for text/borders/structure, earth brown as a warm secondary
 accent (tags, the brand mark), ivory/white for backgrounds. A muted terracotta is added
 for error/failed states since the given palette has no red -- kept close in tone to the
 earth brown so it doesn't clash.
 
-Layout is fluid (not a fixed frame): the sidebar collapses to an icon-only rail below
-~880px viewport width, and content grids use `auto-fill`/`minmax` so they reflow at any
-browser window size (no separate mobile design -- just a resizable desktop window, per
-user 2026-09-01).
+Navigation (rebuilt 2026-09-01, user request): a horizontal step bar across the top
+(Dashboard -> People -> Storyboard -> Spread Editor -> Export) replaces the old persistent
+sidebar -- you start at step 1, and a Continue button at the bottom of each page's content
+takes you to the next step, rather than a nav rail that lets you jump straight into a
+screen whose data doesn't exist yet. Steps ahead of what the pipeline has actually produced
+are locked (greyed out, unclickable) via the same `/status` "ready" map the old sidebar
+used.
+
+Layout is fluid (not a fixed frame): content grids use `auto-fill`/`minmax` so they reflow
+at any browser window size (no separate mobile design -- just a resizable desktop window,
+per user 2026-09-01).
 """
 
 import html
 
+# The step order IS the workflow: Dashboard (setup + run pipeline) -> Storyboard -> People
+# -> Spread Editor -> Export -- matching the pipeline's actual checkpoint order (spread
+# planning finishes and pauses before face detection/people clustering does, per
+# project_app.CHECKPOINTS), reordered 2026-09-01 per user request. Each entry: (href, short
+# label, icon path, one-line purpose shown under the label on the step bar).
 NAV_ITEMS = [
-    ("/", "Dashboard",
+    ("/", "Setup",
      '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/>'
-     '<rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>'),
-    ("/people/", "People",
-     '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c0-3 2.5-5 5.5-5s5.5 2 5.5 5"/>'
-     '<circle cx="17" cy="9" r="2.6"/><path d="M15.5 14.2c2.6.3 4.5 2.1 4.5 4.8"/>'),
+     '<rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+     "Choose photos & size, run the pipeline"),
     ("/storyboard/", "Storyboard",
      '<rect x="2" y="7" width="6" height="10" rx="1.2"/><rect x="9" y="7" width="6" height="10" rx="1.2"/>'
-     '<rect x="16" y="7" width="6" height="10" rx="1.2"/>'),
+     '<rect x="16" y="7" width="6" height="10" rx="1.2"/>',
+     "Review and reorder spreads"),
+    ("/people/", "People",
+     '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c0-3 2.5-5 5.5-5s5.5 2 5.5 5"/>'
+     '<circle cx="17" cy="9" r="2.6"/><path d="M15.5 14.2c2.6.3 4.5 2.1 4.5 4.8"/>',
+     "Review and label who's who"),
     ("/editor/", "Spread Editor",
      '<rect x="3" y="3" width="18" height="18" rx="2"/>'
-     '<path d="M3 15.5l4.7-4.7a1.5 1.5 0 0 1 2.1 0L14 15"/><circle cx="15.7" cy="8.3" r="1.6"/>'),
+     '<path d="M3 15.5l4.7-4.7a1.5 1.5 0 0 1 2.1 0L14 15"/><circle cx="15.7" cy="8.3" r="1.6"/>',
+     "Fine-tune individual spreads"),
     ("/export/", "Export",
-     '<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 19h16"/>'),
+     '<path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 19h16"/>',
+     "Save the finished album PDF"),
 ]
 
 THEME_CSS = """
@@ -63,21 +80,23 @@ html,body{height:100%;}
 body{margin:0;font-family:'IBM Plex Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);}
 a{color:var(--royal);text-decoration:none;} a:hover{color:var(--emerald-strong);}
 h1,h2,h3{font-family:'Newsreader',Georgia,serif;font-weight:600;margin:0;}
-.shell{display:flex;min-height:100vh;width:100%;}
-.sidebar{width:232px;flex-shrink:0;background:var(--sidebar);border-right:1px solid var(--border);
-  display:flex;flex-direction:column;padding:22px 14px;gap:26px;position:sticky;top:0;height:100vh;overflow-y:auto;}
-.brand{padding:0 10px;display:flex;flex-direction:column;gap:2px;}
-.brand-name{font-family:'Newsreader',Georgia,serif;font-size:19px;font-weight:600;color:var(--text);}
+.shell{display:flex;flex-direction:column;min-height:100vh;width:100%;}
+.brandbar{display:flex;align-items:center;gap:10px;padding:14px 28px 0;}
+.brand-name{font-family:'Newsreader',Georgia,serif;font-size:18px;font-weight:600;color:var(--text);}
 .brand-tag{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--brown);font-weight:600;}
-.nav{display:flex;flex-direction:column;gap:3px;}
-.nav-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;color:var(--text-muted);
-  font-size:13.5px;font-weight:500;}
-.nav-item svg{width:17px;height:17px;flex-shrink:0;}
-.nav-item.active{background:var(--emerald-soft);color:var(--emerald-strong);font-weight:600;}
-.nav-item.active svg{color:var(--emerald);}
-.nav-footer{margin-top:auto;padding-top:14px;border-top:1px solid var(--border-soft);font-size:11px;color:var(--text-faint);}
+.stepbar{display:flex;align-items:flex-start;gap:0;padding:16px 28px 18px;border-bottom:1px solid var(--border);
+  background:var(--bg-elev);flex-wrap:wrap;row-gap:14px;}
+.step{display:flex;align-items:center;gap:9px;color:var(--text-muted);position:relative;padding:2px 14px;}
+.step-num{width:26px;height:26px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:700;background:var(--bg-elev-2);border:1px solid var(--border);color:var(--text-faint);}
+.step-label{font-size:13px;font-weight:600;}
+.step-sub{font-size:10.5px;color:var(--text-faint);font-weight:400;display:block;}
+.step.active .step-num{background:var(--emerald);border-color:var(--emerald);color:var(--emerald-ink);}
+.step.active .step-label{color:var(--emerald-strong);}
+.step.locked{opacity:.4;cursor:not-allowed;}
+.step-connector{width:28px;height:1px;background:var(--border);flex-shrink:0;margin-top:13px;}
 .main{flex:1;display:flex;flex-direction:column;min-width:0;}
-.topbar{min-height:60px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;gap:12px;
+.topbar{min-height:56px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;gap:12px;
   padding:12px 28px;border-bottom:1px solid var(--border);background:var(--bg-elev);flex-wrap:wrap;}
 .topbar-title{font-size:17px;}
 .topbar-sub{font-size:12px;color:var(--text-faint);margin-top:2px;}
@@ -88,7 +107,8 @@ h1,h2,h3{font-family:'Newsreader',Georgia,serif;font-weight:600;margin:0;}
 .status-dot.loading{background:var(--royal);animation:pulse 1.4s ease-in-out infinite;}
 .status-dot.ready{background:var(--emerald);}
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
-.content{flex:1;padding:26px 32px;display:flex;flex-direction:column;gap:22px;min-width:0;}
+.content{flex:1;padding:26px 32px;display:flex;flex-direction:column;gap:22px;min-width:0;max-width:1200px;width:100%;margin:0 auto;}
+.step-footer{display:flex;justify-content:space-between;align-items:center;padding-top:6px;border-top:1px solid var(--border-soft);}
 .btn{display:inline-flex;align-items:center;gap:7px;border-radius:8px;font-size:13.5px;font-weight:600;
   padding:9px 16px;border:1px solid var(--border);background:var(--bg-elev);color:var(--text);cursor:pointer;}
 .btn svg{width:15px;height:15px;}
@@ -96,7 +116,7 @@ h1,h2,h3{font-family:'Newsreader',Georgia,serif;font-weight:600;margin:0;}
 .btn-primary:hover{background:var(--emerald-strong);border-color:var(--emerald-strong);}
 .btn-outline:hover{background:var(--bg-elev-2);}
 .btn-danger{background:var(--danger-soft);border-color:var(--danger-soft);color:var(--danger);}
-.btn[disabled]{opacity:.45;cursor:default;}
+.btn[disabled],.btn.locked{opacity:.45;cursor:not-allowed;}
 .card{background:var(--bg-elev);border:1px solid var(--border);border-radius:12px;}
 .section-title{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--text-faint);}
 input[type=text]{font-family:inherit;font-size:13.5px;padding:8px 11px;border:1px solid var(--border);
@@ -108,26 +128,52 @@ input[type=text]{font-family:inherit;font-size:13.5px;padding:8px 11px;border:1p
 .badge-dot.done{background:var(--emerald);}
 .badge-dot.failed{background:var(--danger);}
 @media (max-width: 880px){
-  .sidebar{width:72px;padding:16px 10px;}
-  .brand-tag,.nav-item span,.nav-footer{display:none;}
-  .nav-item{justify-content:center;padding:12px;}
+  .step-sub{display:none;}
+  .step-connector{width:14px;}
+  .stepbar{padding:14px 16px;}
   .content{padding:20px;}
   .topbar{padding:12px 20px;}
+  .brandbar{padding:12px 16px 0;}
 }
 """
 
 
-def _nav_html(active_prefix: str) -> str:
+def _stepbar_html(active_prefix: str) -> str:
     items = []
-    for href, label, icon in NAV_ITEMS:
+    n = len(NAV_ITEMS)
+    for i, (href, label, icon, sub) in enumerate(NAV_ITEMS):
         active = "active" if href == active_prefix else ""
+        # data-nav-href drives the readiness-lock script below -- step 1 ("/") has no
+        # prerequisite and is never locked.
         items.append(
-            f'<a class="nav-item {active}" href="{href}">'
-            f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" '
-            f'stroke-linecap="round" stroke-linejoin="round">{icon}</svg>'
-            f"<span>{html.escape(label)}</span></a>"
+            f'<a class="step {active}" href="{href}" data-nav-href="{href}">'
+            f'<span class="step-num">{i + 1}</span>'
+            f'<span><span class="step-label">{html.escape(label)}</span>'
+            f'<span class="step-sub">{html.escape(sub)}</span></span></a>'
         )
+        if i < n - 1:
+            items.append('<span class="step-connector"></span>')
     return "".join(items)
+
+
+def _step_footer_html(active_prefix: str) -> str:
+    hrefs = [item[0] for item in NAV_ITEMS]
+    if active_prefix not in hrefs:
+        return ""
+    idx = hrefs.index(active_prefix)
+    back = (
+        f'<a class="btn btn-outline" href="{hrefs[idx - 1]}">&larr; Back: {html.escape(NAV_ITEMS[idx - 1][1])}</a>'
+        if idx > 0 else "<span></span>"
+    )
+    if idx < len(hrefs) - 1:
+        next_href, next_label = hrefs[idx + 1], NAV_ITEMS[idx + 1][1]
+        forward = (
+            f'<a class="btn btn-primary" id="continueBtn" href="{next_href}" data-nav-href="{next_href}">'
+            f'Continue: {html.escape(next_label)} &rarr;</a>'
+        )
+    else:
+        forward = "<span></span>"
+    return f'<div class="step-footer">{back}{forward}</div>'
 
 
 def page_shell(active_prefix: str, title: str, subtitle: str, body_html: str,
@@ -140,18 +186,20 @@ def page_shell(active_prefix: str, title: str, subtitle: str, body_html: str,
 </head>
 <body>
 <div class="shell">
-  <aside class="sidebar">
-    <div class="brand"><div class="brand-name">Album Studio</div><div class="brand-tag">Local Workspace</div></div>
-    <nav class="nav">{_nav_html(active_prefix)}</nav>
-    <div class="nav-footer">Fully local &mdash; no cloud upload.</div>
-  </aside>
+  <div class="brandbar"><span class="brand-name">Album Studio</span><span class="brand-tag">&middot; Local Workspace</span></div>
+  <nav class="stepbar">{_stepbar_html(active_prefix)}</nav>
   <div class="main">
     <div class="topbar">
       <div><div class="topbar-title"><h2>{html.escape(title)}</h2></div><div class="topbar-sub">{subtitle}</div></div>
-      <div class="status-pill" id="enginePill"><span class="status-dot" id="engineDot"></span><span id="engineText">AI engine: &hellip;</span></div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div class="status-pill" id="chainPill" style="display:none;"><span id="chainPillText"></span></div>
+        <button class="btn btn-primary" id="resumePipelineBtn" style="display:none;">Resume Pipeline</button>
+        <div class="status-pill" id="enginePill"><span class="status-dot" id="engineDot"></span><span id="engineText">AI engine: &hellip;</span></div>
+      </div>
     </div>
     <div class="content">
 {body_html}
+{_step_footer_html(active_prefix)}
     </div>
   </div>
 </div>
@@ -167,6 +215,63 @@ function pollEngine() {{
 }}
 setInterval(pollEngine, 3000);
 pollEngine();
+
+function pollNavReady() {{
+  fetch('/status').then(r => r.json()).then(data => {{
+    if (!data.ready) return;
+    document.querySelectorAll('[data-nav-href]').forEach(a => {{
+      const href = a.dataset.navHref;
+      const ready = href === '/' || data.ready[href] !== false;
+      a.classList.toggle('locked', !ready);
+      if (!ready && !a.dataset.lockWired) {{
+        a.dataset.lockWired = '1';
+        a.addEventListener('click', (e) => {{
+          if (a.classList.contains('locked')) {{
+            e.preventDefault();
+            alert('This screen isn\\'t ready yet -- run the pipeline further on the Dashboard first.');
+          }}
+        }});
+      }}
+    }});
+
+    // Lets the pipeline be resumed from any step screen, not just Setup, per user request
+    // (2026-09-01: "I shouldn't need to come back to the dashboard screen").
+    const chain = data.chain || {{}};
+    const pill = document.getElementById('chainPill');
+    const pillText = document.getElementById('chainPillText');
+    const resumeBtn = document.getElementById('resumePipelineBtn');
+    if (!pill || !resumeBtn) return;
+    if (chain.running) {{
+      pill.style.display = 'inline-flex';
+      pillText.textContent = 'Pipeline running\\u2026';
+      resumeBtn.style.display = 'none';
+    }} else if (chain.checkpoint_key && chain.checkpoint_label) {{
+      pill.style.display = 'inline-flex';
+      pillText.textContent = chain.checkpoint_label;
+      resumeBtn.style.display = 'inline-flex';
+      resumeBtn.textContent = 'Resume Pipeline';
+    }} else if (chain.failed_key) {{
+      pill.style.display = 'inline-flex';
+      pillText.textContent = 'Stopped: ' + chain.failed_key + ' failed';
+      resumeBtn.style.display = 'none';
+    }} else {{
+      pill.style.display = 'none';
+      resumeBtn.style.display = 'none';
+    }}
+    if (!resumeBtn.dataset.wired) {{
+      resumeBtn.dataset.wired = '1';
+      resumeBtn.addEventListener('click', () => {{
+        resumeBtn.disabled = true;
+        resumeBtn.textContent = 'Starting\\u2026';
+        fetch('/chain/start', {{method: 'POST'}}).then(r => {{
+          if (!r.ok) return r.json().then(d => {{ alert(d.error || 'Could not resume.'); resumeBtn.disabled = false; }});
+        }}).catch(() => {{ resumeBtn.disabled = false; }});
+      }});
+    }}
+  }}).catch(() => {{}});
+}}
+setInterval(pollNavReady, 3000);
+pollNavReady();
 {extra_script}
 </script>
 </body></html>"""

@@ -37,7 +37,7 @@ from pathlib import Path
 
 import web_theme
 from db import connect
-from layout_geometry import PRINT_SIZES
+from layout_geometry import ORIENTATIONS, PRINT_SIZE_LABELS, PRINT_SIZES
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -55,10 +55,11 @@ STAGES = [
      "extra_args": ["--spreads", "{exports}/spreads.json"]},
     {"key": "person_cluster", "label": "People clustering", "script": "person_cluster_stage.py"},
     {"key": "crop", "label": "Intelligent cropping", "script": "crop_stage.py",
-     "extra_args": ["--spreads", "{exports}/spreads.json", "--out", "{exports}/crops.json", "--size", "{size}"]},
+     "extra_args": ["--spreads", "{exports}/spreads.json", "--out", "{exports}/crops.json",
+                     "--size", "{size}", "--orientation", "{orientation}"]},
     {"key": "render", "label": "Render spreads", "script": "render_stage.py",
      "extra_args": ["--spreads", "{exports}/spreads.json", "--crops", "{exports}/crops.json",
-                     "--out-dir", "{exports}/rendered_spreads", "--size", "{size}"]},
+                     "--out-dir", "{exports}/rendered_spreads", "--size", "{size}", "--orientation", "{orientation}"]},
 ]
 STAGE_BY_KEY = {s["key"]: s for s in STAGES}
 STAGE_KEYS = [s["key"] for s in STAGES]
@@ -116,23 +117,23 @@ def _project_status(db_path: str, exports_dir: str) -> dict:
     return status
 
 
-def _build_args(stage: dict, db_path: str, exports_dir: str, source_dir: str, size: str) -> list[str]:
+def _build_args(stage: dict, db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> list[str]:
     args = []
     if stage.get("needs_source_dir"):
         args.append(source_dir)
     args += ["--db", db_path]
     for a in stage.get("extra_args", []):
-        args.append(a.replace("{exports}", exports_dir).replace("{size}", size))
+        args.append(a.replace("{exports}", exports_dir).replace("{size}", size).replace("{orientation}", orientation))
     return args
 
 
-def _run_stage_blocking(key: str, db_path: str, exports_dir: str, source_dir: str, size: str) -> int:
+def _run_stage_blocking(key: str, db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> int:
     """Runs one stage to completion (or until terminated by pause/stop), updating _jobs
     and _current_proc live. Returns the process return code (negative if terminated)."""
     stage = STAGE_BY_KEY[key]
     Path(exports_dir).mkdir(parents=True, exist_ok=True)
     script_path = SRC_DIR / stage["script"]
-    args = _build_args(stage, db_path, exports_dir, source_dir, size)
+    args = _build_args(stage, db_path, exports_dir, source_dir, size, orientation)
     cmd = [sys.executable, str(script_path), *args]
 
     with _jobs_lock:
@@ -201,7 +202,7 @@ def _wipe_project(db_path: str, exports_dir: str) -> None:
         _jobs.clear()
 
 
-def _run_chain(db_path: str, exports_dir: str, source_dir: str, size: str) -> None:
+def _run_chain(db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> None:
     with _chain_lock:
         _chain_state["running"] = True
         _chain_state["finished"] = False
@@ -217,7 +218,7 @@ def _run_chain(db_path: str, exports_dir: str, source_dir: str, size: str) -> No
                 break
             _chain_state["current_index"] = idx
         key = STAGE_KEYS[idx]
-        rc = _run_stage_blocking(key, db_path, exports_dir, source_dir, size)
+        rc = _run_stage_blocking(key, db_path, exports_dir, source_dir, size, orientation)
 
         with _chain_lock:
             stop = _chain_state["stop_requested"]
@@ -254,7 +255,7 @@ def _run_chain(db_path: str, exports_dir: str, source_dir: str, size: str) -> No
             _chain_state["stop_requested"] = False
 
 
-def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str) -> bytes:
+def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> bytes:
     status = _project_status(db_path, exports_dir)
     with _chain_lock:
         chain = dict(_chain_state)
@@ -280,7 +281,7 @@ def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str) ->
           <div class="stage-head">
             <span class="badge {badge}" data-badge>{badge}</span>
             <strong>{i + 1}. {html.escape(stage['label'])}</strong>
-            <code>{html.escape(stage['script'])}</code>
+            <a href="#" class="details-toggle" data-details-toggle style="font-size:11.5px;color:var(--text-faint);">Details</a>
           </div>
           <pre class="log" data-log></pre>
         </div>""")
@@ -330,12 +331,21 @@ form.config input[type=text]{flex:1;min-width:220px;}
   <button type="button" id="chooseFolderBtn" class="btn btn-outline">Choose Folder&hellip;</button>
 </form>
 
-<form class="config card" style="padding:14px 18px;">
-  <label style="font-size:12.5px;color:var(--text-muted);">Print size (page ratio drives layout &mdash; choose before starting):</label>
-  <select id="sizeSelect">
-    <option value="" {'selected' if not size else ''} disabled>-- choose a size --</option>
-    {''.join(f'<option value="{s}" {"selected" if s == size else ""}>{s} in</option>' for s in PRINT_SIZES)}
-  </select>
+<form class="config card" style="padding:14px 18px;display:flex;flex-wrap:wrap;gap:16px;">
+  <div>
+    <label style="font-size:12.5px;color:var(--text-muted);display:block;margin-bottom:6px;">Print size (page ratio drives layout &mdash; choose before starting):</label>
+    <select id="sizeSelect">
+      <option value="" {'selected' if not size else ''} disabled>-- choose a size --</option>
+      {''.join(f'<option value="{s}" {"selected" if s == size else ""}>{html.escape(PRINT_SIZE_LABELS.get(s, s))}</option>' for s in PRINT_SIZES)}
+    </select>
+  </div>
+  <div>
+    <label style="font-size:12.5px;color:var(--text-muted);display:block;margin-bottom:6px;">Orientation:</label>
+    <select id="orientationSelect">
+      <option value="landscape" {"selected" if orientation != "portrait" else ""}>Landscape (spread wider than tall)</option>
+      <option value="portrait" {"selected" if orientation == "portrait" else ""}>Portrait (spread taller than wide)</option>
+    </select>
+  </div>
 </form>
 
 <div class="chain-controls">
@@ -370,8 +380,10 @@ function poll() {
       badgeEl.className = 'badge ' + badge;
       if (job.lines && job.lines.length) {
         logEl.textContent = job.lines.join('\\n');
-        logEl.classList.add('show');
-        logEl.scrollTop = logEl.scrollHeight;
+        if (el.dataset.detailsOpen === '1') {
+          logEl.classList.add('show');
+          logEl.scrollTop = logEl.scrollHeight;
+        }
       }
     }
 
@@ -411,8 +423,25 @@ function poll() {
     document.getElementById('pauseBtn').disabled = !chain.running;
   });
 }
+document.querySelectorAll('[data-details-toggle]').forEach(link => {
+  link.addEventListener('click', (e) => {
+    e.preventDefault();
+    const stageEl = link.closest('.stage');
+    const open = stageEl.dataset.detailsOpen === '1';
+    stageEl.dataset.detailsOpen = open ? '0' : '1';
+    stageEl.querySelector('[data-log]').classList.toggle('show', !open);
+    link.textContent = open ? 'Details' : 'Hide details';
+  });
+});
 document.getElementById('startBtn').addEventListener('click', () => {
-  fetch('/chain/start', {method: 'POST'});
+  const size = document.getElementById('sizeSelect').value;
+  const orientation = document.getElementById('orientationSelect').value;
+  fetch('/chain/start?size=' + encodeURIComponent(size) + '&orientation=' + encodeURIComponent(orientation), {method: 'POST'}).then(r => {
+    if (!r.ok) r.json().then(d => alert(d.error || 'Could not start the pipeline.')).catch(() => {});
+  });
+});
+document.getElementById('orientationSelect').addEventListener('change', (e) => {
+  fetch('/set-orientation?orientation=' + encodeURIComponent(e.target.value), {method: 'POST'});
 });
 document.getElementById('pauseBtn').addEventListener('click', () => {
   fetch('/chain/pause', {method: 'POST'});
@@ -456,7 +485,8 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 qs = urllib.parse.parse_qs(parsed.query)
                 if "source_dir" in qs:
                     state["source_dir"] = qs["source_dir"][0]
-                body = _render_index(db_path, exports_dir, state["source_dir"], state.get("size", ""))
+                body = _render_index(db_path, exports_dir, state["source_dir"], state.get("size", ""),
+                                      state.get("orientation", "landscape"))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -471,7 +501,14 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 if cp:
                     chain["checkpoint_route"] = cp["route"]
                     chain["checkpoint_label"] = cp["label"]
-                body = json.dumps({"jobs": jobs, "chain": chain}).encode("utf-8")
+                proj = _project_status(db_path, exports_dir)
+                ready = {
+                    "/people/": proj.get("people", 0) > 0,
+                    "/storyboard/": proj.get("spreads_json", False),
+                    "/editor/": proj.get("rendered_count", 0) > 0,
+                    "/export/": proj.get("rendered_count", 0) > 0,
+                }
+                body = json.dumps({"jobs": jobs, "chain": chain, "ready": ready}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -511,7 +548,8 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                     return
                 threading.Thread(
                     target=_run_stage_blocking,
-                    args=(key, db_path, exports_dir, state["source_dir"], state.get("size", "")),
+                    args=(key, db_path, exports_dir, state["source_dir"], state.get("size", ""),
+                          state.get("orientation", "landscape")),
                     daemon=True,
                 ).start()
                 self._accept()
@@ -529,6 +567,15 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 if value and value not in PRINT_SIZES:
                     self.send_response(400); self.end_headers(); return
                 state["size"] = value
+                self._accept()
+                return
+
+            if path == "/set-orientation":
+                qs = urllib.parse.parse_qs(parsed.query)
+                value = qs.get("orientation", ["landscape"])[0]
+                if value not in ORIENTATIONS:
+                    self.send_response(400); self.end_headers(); return
+                state["orientation"] = value
                 self._accept()
                 return
 
@@ -555,6 +602,24 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 return
 
             if path == "/chain/start":
+                # Size travels with this same request (query param), per user-reported bug
+                # (2026-09-01): a separate prior /set-size fetch and this one could race
+                # (no ordering guarantee between two independent browser fetches), letting
+                # the chain start with a stale size. Falls back to state["size"] if the
+                # query param is absent (e.g. a bare curl/API call).
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "size" in qs:
+                    requested_size = qs["size"][0]
+                    if requested_size and requested_size not in PRINT_SIZES:
+                        self._send_json(b'{"error": "unknown print size"}', 400)
+                        return
+                    state["size"] = requested_size
+                if "orientation" in qs:
+                    requested_orientation = qs["orientation"][0]
+                    if requested_orientation not in ORIENTATIONS:
+                        self._send_json(b'{"error": "unknown orientation"}', 400)
+                        return
+                    state["orientation"] = requested_orientation
                 if not state.get("size"):
                     self._send_json(b'{"error": "print size not chosen"}', 400)
                     return
@@ -570,7 +635,9 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                         _chain_state["current_index"] = 0
                         _chain_state["finished"] = False
                 threading.Thread(
-                    target=_run_chain, args=(db_path, exports_dir, state["source_dir"], state["size"]),
+                    target=_run_chain,
+                    args=(db_path, exports_dir, state["source_dir"], state["size"],
+                          state.get("orientation", "landscape")),
                     daemon=True,
                 ).start()
                 self._accept()
@@ -608,7 +675,7 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
 
 
 def run(db_path: str, exports_dir: str, source_dir: str, port: int) -> None:
-    state = {"source_dir": source_dir, "size": ""}
+    state = {"source_dir": source_dir, "size": "", "orientation": "landscape"}
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(db_path, exports_dir, state))
     print(f"Serving project pipeline UI at http://127.0.0.1:{port}/  (db: {db_path})")
     try:

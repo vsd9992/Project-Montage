@@ -47,6 +47,17 @@ def _rep_filename(spread: dict) -> str | None:
     return supporting[0] if supporting else None
 
 
+def _not_ready_page(mount: str) -> bytes:
+    body = """
+<div class="card" style="padding:22px 26px;">
+  <p style="font-weight:600;">Not ready yet.</p>
+  <p style="color:var(--text-faint);font-size:12.5px;">The storyboard (spread layout plan) hasn't been
+  generated yet -- run the pipeline further on the Dashboard first.</p>
+  <a class="btn btn-outline" href="/">&larr; Back to Dashboard</a>
+</div>"""
+    return web_theme.page_shell("/storyboard/", "Storyboard", "Not ready yet", body)
+
+
 def _render_index(spreads_path: str, mount: str) -> bytes:
     spreads = sorted(_load_spreads(spreads_path), key=lambda s: s["spread"])
     cards = []
@@ -152,7 +163,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, mount: str = 
 
         def do_GET(self):
             if self.path == "/" or self.path == "":
-                body = _render_index(spreads_path, mount)
+                body = _render_index(spreads_path, mount) if Path(spreads_path).exists() else _not_ready_page(mount)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))

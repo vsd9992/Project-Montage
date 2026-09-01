@@ -15,7 +15,7 @@ import json
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from db import connect
-from layout_geometry import DEFAULT_SIZE, get_geometry
+from layout_geometry import DEFAULT_ORIENTATION, DEFAULT_SIZE, get_geometry
 from style_stage import DEFAULT_STYLE, get_style
 
 JPEG_QUALITY = 92
@@ -51,7 +51,20 @@ def render_spread(conn, spread: dict, crops_by_slot: dict, geometry, style_name:
             # same space before cropping, or the box would land on the wrong region.
             img = ImageOps.exif_transpose(img).convert("RGB")
             cropped = img.crop((round(x1), round(y1), round(x2), round(y2)))
-            resized = cropped.resize((round(rw), round(rh)), Image.LANCZOS)
+
+            # "Contain" fit, not "cover"/crop-to-fill (changed 2026-09-01 per user report:
+            # crop-to-fill was cutting off faces whenever a photo's aspect didn't match its
+            # slot exactly). The safety-margin crop from crop_stage.py is scaled down
+            # uniformly to fit inside the slot rect and centred -- the whole photo (and any
+            # face crop_stage protected) is always fully visible; any leftover space within
+            # the rect shows the background/mat color instead of being cropped away.
+            cw, ch = cropped.size
+            scale = min(rw / cw, rh / ch) if cw and ch else 1.0
+            fit_w, fit_h = round(cw * scale), round(ch * scale)
+            resized = cropped.resize((fit_w, fit_h), Image.LANCZOS)
+            paste_x = round(rx + (rw - fit_w) / 2)
+            paste_y = round(ry + (rh - fit_h) / 2)
+
             if style["mat_width"]:
                 mw = style["mat_width"]
                 mat_box = (round(rx - mw), round(ry - mw), round(rw + 2 * mw), round(rh + 2 * mw))
@@ -59,7 +72,12 @@ def render_spread(conn, spread: dict, crops_by_slot: dict, geometry, style_name:
                     [mat_box[0], mat_box[1], mat_box[0] + mat_box[2], mat_box[1] + mat_box[3]],
                     fill=style["mat_color"],
                 )
-            canvas.paste(resized, (round(rx), round(ry)))
+            # Fill the slot rect itself with the background color first so any leftover
+            # space around a contain-fit photo reads as intentional matting, not a hole.
+            ImageDraw.Draw(canvas).rectangle(
+                [round(rx), round(ry), round(rx + rw), round(ry + rh)], fill=style["background_color"],
+            )
+            canvas.paste(resized, (paste_x, paste_y))
 
     caption = spread.get("event", "").replace("_", " ").title()
     if caption:
@@ -77,13 +95,14 @@ def render_spread(conn, spread: dict, crops_by_slot: dict, geometry, style_name:
 
 
 def run(db_path: str, spreads_path: str, crops_path: str, out_dir: str, limit: int | None,
-        style_name: str = DEFAULT_STYLE, size: str = DEFAULT_SIZE) -> None:
+        style_name: str = DEFAULT_STYLE, size: str = DEFAULT_SIZE,
+        orientation: str = DEFAULT_ORIENTATION) -> None:
     with open(spreads_path, encoding="utf-8") as f:
         spreads = {s["spread"]: s for s in json.load(f)}
     with open(crops_path, encoding="utf-8") as f:
         crops = {c["spread"]: c["crops"] for c in json.load(f)}
 
-    geometry = get_geometry(size)
+    geometry = get_geometry(size, orientation)
     conn = connect(db_path)
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -112,5 +131,6 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="Render only the first N spreads")
     parser.add_argument("--style", default=DEFAULT_STYLE, help="Design style name (see style_stage.STYLES)")
     parser.add_argument("--size", default=DEFAULT_SIZE, help="Print size (see layout_geometry.PRINT_SIZES)")
+    parser.add_argument("--orientation", default=DEFAULT_ORIENTATION, choices=["landscape", "portrait"])
     args = parser.parse_args()
-    run(args.db, args.spreads, args.crops, args.out_dir, args.limit, args.style, args.size)
+    run(args.db, args.spreads, args.crops, args.out_dir, args.limit, args.style, args.size, args.orientation)

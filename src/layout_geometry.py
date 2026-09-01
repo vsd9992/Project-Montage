@@ -16,11 +16,31 @@ DPI = 300
 MARGIN_IN = 0.5
 GUTTER_IN = 0.2
 
+# Key = "<spread height>x<spread width>" in inches (the two-page canvas itself, not a
+# single physical page -- e.g. "8x16" is an 8in-tall book whose spread is two 8x8 pages).
 PRINT_SIZES = {
+    "8x8": (8, 8),
+    "8x12": (12, 8),
+    "8x16": (16, 8),
+    "10x10": (10, 10),
+    "10x15": (15, 10),
+    "10x20": (20, 10),
     "12x18": (18, 12),
     "12x24": (24, 12),
     "12x30": (30, 12),
     "12x36": (36, 12),
+}
+PRINT_SIZE_LABELS = {
+    "8x8": "8in tall book, compact square spread -- small keepsake album",
+    "8x12": "8in tall book, wider spread -- coffee-table album, moderate length",
+    "8x16": "8in tall book, panoramic spread -- coffee-table album, longer story",
+    "10x10": "10in tall book, square spread -- classic wedding album",
+    "10x15": "10in tall book, wider spread -- standard-length story",
+    "10x20": "10in tall book, panoramic spread -- longer story",
+    "12x18": "12in tall book, wide spread -- large format, moderate length",
+    "12x24": "12in tall book, panoramic spread -- large format, standard length",
+    "12x30": "12in tall book, panoramic spread -- large format, long/detailed story",
+    "12x36": "12in tall book, panoramic spread -- large format, full-event epic length",
 }
 DEFAULT_SIZE = "12x36"
 
@@ -110,10 +130,20 @@ class Geometry:
         return {slot: rw / rh for slot, (rx, ry, rw, rh) in self.layout_rects[layout].items()}
 
 
-def get_geometry(size: str = DEFAULT_SIZE) -> Geometry:
+ORIENTATIONS = ("landscape", "portrait")
+DEFAULT_ORIENTATION = "landscape"
+
+
+def get_geometry(size: str = DEFAULT_SIZE, orientation: str = DEFAULT_ORIENTATION) -> Geometry:
     if size not in PRINT_SIZES:
         raise ValueError(f"Unknown print size '{size}'. Available: {sorted(PRINT_SIZES)}")
+    if orientation not in ORIENTATIONS:
+        raise ValueError(f"Unknown orientation '{orientation}'. Available: {ORIENTATIONS}")
     width_in, height_in = PRINT_SIZES[size]
+    # PRINT_SIZES entries are all stored landscape (spread wider than tall) -- portrait
+    # just swaps the two dimensions, added 2026-09-01 per user request.
+    if orientation == "portrait":
+        width_in, height_in = height_in, width_in
     return Geometry(width_in, height_in)
 
 

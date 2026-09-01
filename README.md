@@ -44,8 +44,10 @@ real ~1,800-photo dataset before moving to the next:
 3. **Desktop application** — a real browser UI over all of the above: project/pipeline
    management, drag-and-drop storyboard reordering, people labeling, and a spread editor
    with lock/regenerate. Originally four separate local web tools on four ports;
-   consolidated into one process/one port with a shared design system (see
-   [Architecture](#architecture)).
+   consolidated into one process/one port with a shared design system, then rebuilt again
+   (2026-09-01) into a guided step-by-step wizard (Setup → Storyboard → People → Spread
+   Editor → Export) that pauses the pipeline for review at the right points instead of
+   running straight through to export (see [Architecture](#architecture)).
 4. **Advanced AI (in progress)** — conversational spread editing ("give the bride
    portrait more prominence") is implemented; face-relationship inference, richer
    emotional scoring, video support, and learned style preferences are not yet built.
@@ -65,7 +67,11 @@ See [Roadmap](#roadmap--current-status) for exactly what's done vs. planned.
   browser UI lets you name, merge, or deprioritize clusters.
 - **Automatic storyboard + spread layout.** Event/story detection sequences photos
   chronologically by section; a layout grammar assigns hero/supporting slots per spread.
-- **Content-aware cropping** that keeps detected faces in frame.
+- **Faces are never cropped out.** Content-aware cropping only ever trims background
+  *around* a detected face (never the face region itself), and the renderer fits each
+  photo into its slot preserving its own aspect ratio (contain-fit, not crop-to-fill) —
+  so a photo's natural proportions are respected instead of being force-cropped to match
+  a fixed slot shape.
 - **Multiple design styles** (modern minimal, luxury wedding, editorial, documentary),
   separate from layout, so changing style never touches slot geometry.
 - **Editable, not a black box.** Every spread can be locked, regenerated individually or
@@ -73,11 +79,14 @@ See [Roadmap](#roadmap--current-status) for exactly what's done vs. planned.
 - **Conversational editing.** Type an instruction on a spread ("use fewer photos here",
   "these two look repetitive") and a local VLM proposes a small, reviewable set of slot
   swaps you approve or discard — it never touches pixels directly.
-- **Print production, not a demo.** Multiple print sizes (12×18 through 12×36), 300 DPI
-  target, preflight checks (resolution, missing assets) before you export a real PDF.
+- **Print production, not a demo.** Ten print sizes (8×8 through 12×36) in either
+  landscape or portrait orientation, 300 DPI target, preflight checks (resolution, missing
+  assets) before you export — a native Save As dialog lets you name the PDF and pick where
+  it goes, and the working project data clears automatically after a successful export so
+  the next project starts fresh.
 - **One app, one browser tab.** A single process serves the whole UI; the heavy AI model
   only loads on demand (running a pipeline stage, or first use of chat editing) — never
-  at startup.
+  at startup, and it's released again right after each conversational-editing reply.
 
 ## Architecture
 
@@ -86,23 +95,30 @@ See [Roadmap](#roadmap--current-status) for exactly what's done vs. planned.
                                      │
                               src/app.py  (single public port)
                           reverse-proxies by path prefix
-        ┌───────────┬───────────────┼───────────────┬────────────┐
-        │            │               │               │            │
-   Dashboard       People        Storyboard     Spread Editor    Export
-  project_app.py  label_people   reorder_       spread_editor    export_app.py
-   (pipeline       _app.py       spreads_app.py  _app.py          (preflight +
-    runner)        (face                                          PDF export)
-                    clusters)
+   ┌─────────┬──────────────┬──────────────┬───────────────┬────────────┐
+   │          │               │              │               │            │
+ Setup    Storyboard       People      Spread Editor       Export
+project_app  reorder_     label_people  spread_editor    export_app.py
+ .py         spreads_app   _app.py      _app.py           (preflight +
+(pipeline    .py           (face                           save-as PDF
+ runner)                    clusters)                       export)
 ```
 
-Each section above is its own `http.server`-based app (stdlib only, no web framework),
-run on its own internal-only localhost port as a background thread inside the single
-`app.py` process; `app.py` is the only port exposed to the browser, and forwards each
-request to the right section. This replaced four/five separate processes on separate
-ports (`project_app.py --port 8002`, etc.) with one double-click launcher
-(`run_album_studio.bat`). All five screens share one design system
-(`src/web_theme.py`): a light theme, a persistent sidebar nav, and a live AI-engine
-status indicator, laid out fluidly so it works at any browser window width.
+Each screen above is its own `http.server`-based app (stdlib only, no web framework), run
+on its own internal-only localhost port as a background thread inside the single `app.py`
+process; `app.py` is the only port exposed to the browser, and forwards each request to
+the right section. This replaced four/five separate processes on separate ports
+(`project_app.py --port 8002`, etc.) with one double-click launcher
+(`run_album_studio.bat`). All five screens share one design system (`src/web_theme.py`): a
+light theme, a horizontal step bar (not a persistent sidebar) that presents the app as a
+guided wizard — Setup → Storyboard → People → Spread Editor → Export — with steps locked
+until their data actually exists, a Back/Continue footer, a "Resume Pipeline" control
+available from any screen so you never have to return to Setup mid-project, and a live
+AI-engine status indicator. Laid out fluidly so it works at any browser window width.
+
+The pipeline chain doesn't run straight through to a finished PDF: it auto-pauses for
+review after storyboard planning, after people clustering, and after rendering, and export
+is always a separate manual action from the Export screen — never part of the auto-chain.
 
 The **processing pipeline** itself is a sequence of independent, resumable, idempotent
 stages (each re-run skips already-processed rows/files), driven by the Dashboard screen
@@ -128,8 +144,8 @@ render step, so re-ordering, re-styling, or re-cropping never means starting ove
 | Quality scoring | Ranks shots within a burst by sharpness/exposure | OpenCV |
 | Scene understanding | Judges album-worthiness, tags each shot's event/moment | **Qwen3-VL** (local, via `llama.cpp`'s `llama-server`) |
 | Face detection + clustering | Detects faces, groups them into people | **InsightFace** (`buffalo_l` model pack) |
-| Layout + cropping | Assigns spread layouts, computes face-aware crops | Custom layout grammar + Pillow |
-| Rendering | Composites final spread images | Pillow |
+| Layout + cropping | Assigns spread layouts, computes a face-safe crop region (never crops into a detected face) | Custom layout grammar + Pillow |
+| Rendering | Contain-fits each photo into its slot (preserves its aspect ratio, no forced crop-to-fill) and composites final spread images | Pillow |
 | Conversational editing | Turns a plain-English instruction into slot-swap proposals | Qwen3-VL (text-only prompt against the same `llama-server`) |
 | Web UI | Single-process local app, five screens | Python stdlib `http.server` (no framework) |
 | PDF export | Preflight checks + multi-page PDF assembly | Pillow |
@@ -187,9 +203,10 @@ or from any shell:
   --rendered-dir exports\rendered_spreads --out-pdf exports\album.pdf
 ```
 
-This opens `http://127.0.0.1:8000/` in your browser. Point the Dashboard's "Source photo
-directory" field at your event's photo folder and hit Start. No AI model loads until a
-stage that needs one actually runs (Qwen3-VL for scene understanding) or you open the
+This opens `http://127.0.0.1:8000/` in your browser at the Setup screen. Use "Choose
+Folder…" to pick your event's photo folder (opens a native OS dialog), choose a print size
+and orientation from the dropdowns, then hit Start. No AI model loads until a stage that
+needs one actually runs (Qwen3-VL for scene understanding) or you open the
 conversational-editing chat.
 
 Each stage is also runnable standalone from the CLI (`python src/import_stage.py --help`,
@@ -197,12 +214,21 @@ etc.) if you want to script the pipeline instead of using the Dashboard.
 
 ### 4. Review, edit, export
 
-- **People** — name or merge face clusters.
-- **Storyboard** — drag spreads into a different order.
-- **Spread Editor** — swap a slot's photo, lock a spread, regenerate one or all unlocked
-  spreads, or type a plain-English instruction in the chat panel.
-- **Export** — check the preflight results (resolution, missing assets) and export the
-  final PDF.
+The Dashboard's Start button runs the pipeline as far as the next checkpoint, then pauses
+and points you at the right screen; a "Resume Pipeline" control on every screen lets you
+continue without going back to Setup.
+
+- **Storyboard** — drag spreads into a different order (pipeline pauses here first, right
+  after spreads are planned).
+- **People** — name or merge face clusters (pipeline pauses here next, after clustering).
+- **Spread Editor** — swap a slot's photo via a photo-picker (click a same-event
+  candidate's thumbnail, no typing filenames), lock a spread, regenerate one or all
+  unlocked spreads, or type a plain-English instruction in the chat panel (pipeline pauses
+  here last, after rendering).
+- **Export** — check the preflight results (resolution, missing assets), then click Export:
+  a native Save As dialog lets you name the PDF and choose where it goes. After a
+  successful export, the working project database and exports folder are wiped
+  automatically so the next project starts clean — your source photos are never touched.
 
 ## Project structure
 
@@ -245,9 +271,13 @@ SQLite database/exports, model weights, and this project's own AI-agent working 
 - **Windows-only font paths.** `style_stage.py` looks up caption fonts from
   `C:\Windows\Fonts`; on macOS/Linux you'll need to point it at your system's font
   directory (or embed fonts) before styles render captions correctly.
-- **Single fixed canvas size per run.** Print size/style are chosen when you start the
-  pipeline (or via `--size`/`--style` flags), not editable per-spread after rendering —
-  changing them means re-rendering.
+- **Single fixed canvas size per run.** Print size, orientation, and style are chosen on
+  the Setup screen before the pipeline runs (or via `--size`/`--orientation`/`--style`
+  flags), not editable per-spread after rendering — changing them means re-rendering.
+- **No undo when going back a wizard step.** Going back to an earlier screen doesn't
+  revert what later steps already produced — that needs a project-state snapshot/
+  versioning mechanism, deferred to Phase 5 rather than half-built (see
+  [Roadmap](#roadmap--current-status)).
 - **Conversational editing is deliberately narrow.** It can only swap which photo fills
   an existing slot, from same-event candidates the model is explicitly shown. It cannot
   change a spread's layout, slot count, or move a photo to a different spread — those

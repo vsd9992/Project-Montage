@@ -128,7 +128,7 @@ def run(db_path: str, exports_dir: str, source_dir: str, spreads_path: str, crop
     # before the pipeline can run, since page ratio drives spread layout) is what the
     # editor/export screens must render/export at too -- a dict so later screens see
     # whatever the user picked, not whatever --size this process happened to start with.
-    project_state: dict = {"source_dir": source_dir, "size": size}
+    project_state: dict = {"source_dir": source_dir, "size": size, "orientation": "landscape"}
 
     dashboard = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_DASHBOARD),

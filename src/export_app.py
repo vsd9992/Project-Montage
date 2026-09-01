@@ -21,7 +21,7 @@ from pathlib import Path
 
 import web_theme
 from export_pdf import export_pdf, run_preflight
-from layout_geometry import DEFAULT_SIZE
+from layout_geometry import DEFAULT_ORIENTATION, DEFAULT_SIZE
 from style_stage import DEFAULT_STYLE
 
 SIZES = ["12x18", "12x24", "12x30", "12x36"]
@@ -50,11 +50,11 @@ def _preflight_html(results: list[dict]) -> str:
     return "".join(rows)
 
 
-def _render_index(rendered_dir: str, spreads_path: str, dest_dir: str, size: str, style: str,
+def _render_index(rendered_dir: str, spreads_path: str, size: str, orientation: str, style: str,
                    mount: str, message: str | None) -> bytes:
-    results = run_preflight(rendered_dir, spreads_path, size) if Path(spreads_path).exists() else []
+    results = run_preflight(rendered_dir, spreads_path, size, orientation) if Path(spreads_path).exists() else []
     passed = sum(1 for r in results if r.get("ok"))
-    can_export = bool(results) and bool(dest_dir)
+    can_export = bool(results)
     extra_head = """
 <style>
 .preflight-row{display:flex;align-items:flex-start;gap:10px;padding:9px 0;border-bottom:1px solid var(--border-soft);font-size:12.5px;}
@@ -73,18 +73,12 @@ form.config input[type=text]{flex:1;min-width:220px;}
 {message_html}
 <div class="card" style="padding:18px 20px;">
   <div class="section-title" style="margin-bottom:10px;">Current output settings</div>
-  <div class="kv"><div class="k">Print size</div><div>{html.escape(size)}</div></div>
+  <div class="kv"><div class="k">Print size</div><div>{html.escape(size)} ({html.escape(orientation)})</div></div>
   <div class="kv"><div class="k">Design style</div><div>{html.escape(style)}</div></div>
   <div class="kv"><div class="k">Rendered dir</div><div>{html.escape(rendered_dir)}</div></div>
   <p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">To change size or style, re-render
   from the Dashboard pipeline or Spread Editor's "regenerate all", then reopen this screen.</p>
 </div>
-
-<form class="config card" style="padding:14px 18px;" id="destForm">
-  <label style="font-size:12.5px;color:var(--text-muted);">Export destination folder (album.pdf is written here):</label>
-  <input type="text" id="destInput" name="dest_dir" value="{html.escape(dest_dir)}" placeholder="D:\\path\\to\\deliver">
-  <button type="button" id="chooseDestBtn" class="btn btn-outline">Choose Folder&hellip;</button>
-</form>
 
 <div class="card" style="padding:18px 20px;">
   <div class="section-title" style="margin-bottom:10px;">Preflight check ({passed} / {len(results)} passed)</div>
@@ -92,40 +86,29 @@ form.config input[type=text]{flex:1;min-width:220px;}
 </div>
 
 <div class="card" style="padding:18px 20px;">
-  <p style="font-size:11.5px;color:var(--brown);font-weight:600;">After a successful export, the working
-  project data (database + exports folder: spreads, crops, rendered pages) is cleared automatically so you
-  can start the next project fresh. Your source photo folder and the exported PDF (already written to the
-  destination above) are never touched.</p>
-  <button id="exportBtn" class="btn btn-primary" {'disabled' if not can_export else ''}>Export PDF</button>
+  <p style="font-size:11.5px;color:var(--brown);font-weight:600;">Clicking Export opens a Save dialog
+  where you choose the file name and location. After a successful export, the working project data
+  (database + exports folder: spreads, crops, rendered pages) is cleared automatically so you can start
+  the next project fresh. Your source photo folder is never touched.</p>
+  <button id="exportBtn" class="btn btn-primary" {'disabled' if not can_export else ''}>Export PDF&hellip;</button>
   <span id="exportStatus"></span>
 </div>"""
     extra_script = ("""
-document.getElementById('chooseDestBtn').addEventListener('click', () => {
-  const btn = document.getElementById('chooseDestBtn');
-  btn.disabled = true;
-  btn.textContent = 'Waiting for dialog...';
-  fetch('""" + mount + """/pick-dest-folder', {method: 'POST'}).then(r => r.json()).then(data => {
-    btn.disabled = false;
-    btn.textContent = 'Choose Folder\\u2026';
-    if (data.path) {
-      document.getElementById('destInput').value = data.path;
-      document.getElementById('exportBtn').disabled = false;
-    }
-  }).catch(() => { btn.disabled = false; btn.textContent = 'Choose Folder\\u2026'; });
-});
-document.getElementById('destInput').addEventListener('change', (e) => {
-  fetch('""" + mount + """/set-dest-folder?dest_dir=' + encodeURIComponent(e.target.value), {method: 'POST'});
-});
 const btn = document.getElementById('exportBtn');
 if (btn) {
   btn.addEventListener('click', () => {
     btn.disabled = true;
-    document.getElementById('exportStatus').textContent = 'Exporting...';
+    document.getElementById('exportStatus').textContent = 'Choose a destination folder in the dialog...';
     fetch('""" + mount + """/export', {method: 'POST'}).then(r => r.json()).then(data => {
+      if (data.cancelled) {
+        document.getElementById('exportStatus').textContent = '';
+        btn.disabled = false;
+        return;
+      }
       document.getElementById('exportStatus').textContent = data.ok
         ? ('Exported ' + data.pages + ' pages to ' + data.out + '. Project data cleared -- ready for the next project.')
         : ('Failed: ' + data.error);
-      btn.disabled = !data.ok ? false : true;
+      btn.disabled = false;
     }).catch(() => {
       document.getElementById('exportStatus').textContent = 'Export failed (network error).';
       btn.disabled = false;
@@ -146,10 +129,9 @@ def make_handler(rendered_dir: str, spreads_path: str, db_path: str, exports_dir
     def _size() -> str:
         return (size.get("size") or DEFAULT_SIZE) if isinstance(size, dict) else size
 
-    # Chosen on this screen via native folder dialog, per user request (2026-09-01): export
-    # asks where to deliver the PDF rather than always writing into the (about-to-be-wiped)
-    # working exports/ folder.
-    dest_state = {"dest_dir": ""}
+    def _orientation() -> str:
+        return (size.get("orientation") or DEFAULT_ORIENTATION) if isinstance(size, dict) else DEFAULT_ORIENTATION
+
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -165,7 +147,7 @@ def make_handler(rendered_dir: str, spreads_path: str, db_path: str, exports_dir
 
         def do_GET(self):
             if self.path == "/" or self.path == "":
-                body = _render_index(rendered_dir, spreads_path, dest_state["dest_dir"], _size(), style, mount, None)
+                body = _render_index(rendered_dir, spreads_path, _size(), _orientation(), style, mount, None)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -176,51 +158,41 @@ def make_handler(rendered_dir: str, spreads_path: str, db_path: str, exports_dir
             self.end_headers()
 
         def do_POST(self):
-            parsed = urllib.parse.urlparse(self.path)
-            path = parsed.path
-
-            if path == "/set-dest-folder":
-                qs = urllib.parse.parse_qs(parsed.query)
-                dest_state["dest_dir"] = qs.get("dest_dir", [""])[0]
-                self._send_json(b"{}")
-                return
-
-            if path == "/pick-dest-folder":
-                try:
-                    import tkinter
-                    from tkinter import filedialog
-                    root = tkinter.Tk()
-                    root.withdraw()
-                    root.attributes("-topmost", True)
-                    chosen = filedialog.askdirectory(
-                        initialdir=dest_state["dest_dir"] or None, title="Choose export destination folder",
-                    )
-                    root.destroy()
-                except Exception:
-                    chosen = ""
-                if chosen:
-                    dest_state["dest_dir"] = chosen
-                self._send_json(json.dumps({"path": chosen or ""}).encode("utf-8"))
-                return
-
-            if path != "/export":
+            if self.path != "/export":
                 self.send_response(404)
                 self.end_headers()
                 return
 
             with lock:
                 try:
-                    dest_dir = dest_state["dest_dir"]
-                    if not dest_dir:
-                        raise RuntimeError("choose a destination folder first")
-                    os.makedirs(dest_dir, exist_ok=True)
-                    out_pdf = os.path.join(dest_dir, "album.pdf")
+                    # Single native "Save As" dialog, per user request (2026-09-01): pick
+                    # location AND filename in one step, no separate "choose folder" step
+                    # and no auto-generated name forced on the user.
+                    try:
+                        import tkinter
+                        from tkinter import filedialog
+                        root = tkinter.Tk()
+                        root.withdraw()
+                        root.attributes("-topmost", True)
+                        out_pdf = filedialog.asksaveasfilename(
+                            title="Save album as", defaultextension=".pdf", initialfile="album.pdf",
+                            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+                        )
+                        root.destroy()
+                    except Exception:
+                        out_pdf = ""
+                    if not out_pdf:
+                        self._send_json(json.dumps({"cancelled": True}).encode("utf-8"))
+                        return
+                    os.makedirs(os.path.dirname(out_pdf) or ".", exist_ok=True)
                     current_size = _size()
-                    results = run_preflight(rendered_dir, spreads_path, current_size)
+                    current_orientation = _orientation()
+                    results = run_preflight(rendered_dir, spreads_path, current_size, current_orientation)
                     failed = [r for r in results if not r.get("ok")]
                     if failed:
                         raise RuntimeError(f"{len(failed)} spread(s) failed preflight")
-                    export_pdf(rendered_dir, spreads_path, out_pdf, skip_failed=False, size=current_size)
+                    export_pdf(rendered_dir, spreads_path, out_pdf, skip_failed=False,
+                               size=current_size, orientation=current_orientation)
                     # Export succeeded and the PDF is safely outside exports_dir now -- clear
                     # the working project data (DB + exports/ folder: spreads.json,
                     # crops.json, rendered_spreads/) so the next project starts fresh, per

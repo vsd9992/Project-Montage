@@ -32,7 +32,7 @@ import web_theme
 from conversation_stage import candidate_pool, propose_edits
 from crop_stage import compute_crop
 from db import connect
-from layout_geometry import DEFAULT_SIZE, get_geometry
+from layout_geometry import DEFAULT_ORIENTATION, DEFAULT_SIZE, get_geometry
 from qwen_stage import start_server, stop_server
 from render_stage import render_spread
 from spread_stage import effective_orientation
@@ -77,10 +77,10 @@ def _rendered_path(out_dir: str, spread_number: int) -> str | None:
 
 
 def _regenerate_spread(conn: sqlite3.Connection, spread: dict, crops_all: list[dict],
-                        out_dir: str, size: str, style: str) -> str:
+                        out_dir: str, size: str, orientation: str, style: str) -> str:
     """Recomputes crops for `spread`'s current slots and re-renders it. Returns the
     written image path. Mutates crops_all in place (replacing/adding this spread's entry)."""
-    geometry = get_geometry(size)
+    geometry = get_geometry(size, orientation)
     aspects = geometry.slot_aspect_ratios(spread["layout"])
     crops = {}
     for slot, info in spread["slots"].items():
@@ -120,6 +120,17 @@ def _grid_html(spreads: list[dict], mount: str) -> str:
     return "".join(cards)
 
 
+def _not_ready_page(mount: str, what: str) -> bytes:
+    body = f"""
+<div class="card" style="padding:22px 26px;">
+  <p style="font-weight:600;">Not ready yet.</p>
+  <p style="color:var(--text-faint);font-size:12.5px;">{html.escape(what)} -- run the pipeline
+  further on the Dashboard first.</p>
+  <a class="btn btn-outline" href="/">&larr; Back to Dashboard</a>
+</div>"""
+    return web_theme.page_shell("/editor/", "Spread Editor", "Not ready yet", body)
+
+
 def _render_grid(spreads_path: str, mount: str) -> bytes:
     spreads = _load_json(spreads_path)
     extra_head = """
@@ -152,12 +163,13 @@ document.getElementById('bulkBtn').addEventListener('click', () => {
     )
 
 
-def _render_detail(spreads_path: str, spread_number: int, mount: str) -> bytes | None:
+def _render_detail(spreads_path: str, spread_number: int, mount: str, out_dir: str) -> bytes | None:
     spreads = _load_json(spreads_path)
     spread = next((s for s in spreads if s["spread"] == spread_number), None)
     if spread is None:
         return None
     locked = spread.get("locked", False)
+    has_render = _rendered_path(out_dir, spread_number) is not None
     rows = []
     for slot in _slot_order(spread["slots"].keys()):
         info = spread["slots"][slot]
@@ -202,7 +214,9 @@ a.back { display: inline-block; margin-bottom: 1em; font-size: 12.5px; color: va
 <a class="back" href="{mount}/">&larr; All spreads</a>
 <h1 style="font-size:18px;">Spread {spread_number} &mdash; {html.escape(spread.get('event') or '')} ({html.escape(spread['layout'])})</h1>
 {'<p class="locked-note">Locked -- unlock to edit or regenerate.</p>' if locked else ''}
-<img class="rendered" src="{mount}/rendered/{spread_number}?t={hash(json.dumps(spread))}">
+{f'<img class="rendered" src="{mount}/rendered/{spread_number}?t={hash(json.dumps(spread))}">' if has_render else
+ '<div class="card" style="padding:16px 20px;color:var(--text-faint);font-size:12.5px;">'
+ 'Not rendered yet -- click "Regenerate this spread" below, or run the Render stage on the Dashboard.</div>'}
 <div class="controls">
   <form method="post" action="{mount}/spread/{spread_number}/lock" style="display:inline">
     <button type="submit" class="btn btn-outline">{lock_label}</button>
@@ -340,6 +354,9 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
     def _size() -> str:
         return (size.get("size") or DEFAULT_SIZE) if isinstance(size, dict) else size
 
+    def _orientation() -> str:
+        return (size.get("orientation") or DEFAULT_ORIENTATION) if isinstance(size, dict) else DEFAULT_ORIENTATION
+
     # Lazily started on first chat request, kept running for the process lifetime -- one
     # model load per editing session rather than per request (idea §21 load/batch/unload).
     # engine_state (shared with app.py's /api/engine-status) tracks idle/loading/ready so
@@ -385,6 +402,9 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             if path == "/":
+                if not Path(spreads_path).exists():
+                    self._send_bytes(_not_ready_page(mount, "The storyboard hasn't been generated yet"), "text/html; charset=utf-8")
+                    return
                 self._send_bytes(_render_grid(spreads_path, mount), "text/html; charset=utf-8")
                 return
             if path.startswith("/spread/") and "/candidates/" not in path:
@@ -392,7 +412,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                     n = int(path.rsplit("/", 1)[-1])
                 except ValueError:
                     self.send_response(400); self.end_headers(); return
-                body = _render_detail(spreads_path, n, mount)
+                body = _render_detail(spreads_path, n, mount, out_dir)
                 if body is None:
                     self.send_response(404); self.end_headers(); return
                 self._send_bytes(body, "text/html; charset=utf-8")
@@ -504,7 +524,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                         if spread.get("locked", False):
                             skipped += 1
                             continue
-                        _regenerate_spread(conn, spread, crops_all, out_dir, _size(), style)
+                        _regenerate_spread(conn, spread, crops_all, out_dir, _size(), _orientation(), style)
                         regenerated += 1
                 finally:
                     conn.close()
@@ -626,7 +646,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                     crops_all = _load_json(crops_path) if Path(crops_path).exists() else []
                     conn = connect(db_path)
                     try:
-                        _regenerate_spread(conn, spread, crops_all, out_dir, _size(), style)
+                        _regenerate_spread(conn, spread, crops_all, out_dir, _size(), _orientation(), style)
                     finally:
                         conn.close()
                     _save_json(crops_path, crops_all)
