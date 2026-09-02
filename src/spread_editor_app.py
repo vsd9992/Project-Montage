@@ -167,24 +167,40 @@ document.getElementById('bulkBtn').addEventListener('click', () => {
     )
 
 
-def _render_detail(spreads_path: str, spread_number: int, mount: str, out_dir: str) -> bytes | None:
+def _render_detail(spreads_path: str, spread_number: int, mount: str, out_dir: str, db_path: str) -> bytes | None:
     spreads = _load_json(spreads_path)
     spread = next((s for s in spreads if s["spread"] == spread_number), None)
     if spread is None:
         return None
     locked = spread.get("locked", False)
     has_render = _rendered_path(out_dir, spread_number) is not None
+    conn = connect(db_path)
+    try:
+        dup_flags = {
+            row[0]: bool(row[1])
+            for row in conn.execute(
+                "SELECT filename, is_duplicate FROM photos WHERE filename IN ({})".format(
+                    ",".join("?" * len(spread["slots"]))
+                ),
+                [info["filename"] for info in spread["slots"].values()],
+            )
+        } if spread["slots"] else {}
+    finally:
+        conn.close()
     rows = []
     for slot in _slot_order(spread["slots"].keys()):
         info = spread["slots"][slot]
-        filename = html.escape(info["filename"])
+        raw_filename = info["filename"]
+        filename = html.escape(raw_filename)
+        is_dup = dup_flags.get(raw_filename, False)
         rows.append(f"""
         <div class="slot card">
           <img src="{mount}/slot_thumb/{spread_number}/{urllib.parse.quote(slot)}">
           <div>
-            <div><strong>{html.escape(slot)}</strong></div>
+            <div><strong>{html.escape(slot)}</strong> {'<span class="dup-badge">Duplicate</span>' if is_dup else ''}</div>
             <div style="font-size:11.5px;color:var(--text-faint);max-width:14em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{filename}</div>
             <button type="button" class="btn btn-outline swap-btn" data-slot="{html.escape(slot)}" {'disabled' if locked else ''}>Swap&hellip;</button>
+            <button type="button" class="btn btn-outline btn-sm dup-toggle-btn" data-filename="{filename}" data-dup="{'1' if is_dup else '0'}">{'Unmark duplicate' if is_dup else 'Mark duplicate'}</button>
           </div>
         </div>""")
     lock_label = "Unlock" if locked else "Lock"
@@ -213,6 +229,13 @@ a.back { display: inline-block; margin-bottom: 1em; font-size: 12.5px; color: va
 .pick-card:hover { border-color:var(--royal); }
 .pick-card img { width:100%; height:80px; object-fit:cover; border-radius:6px; }
 .pick-card div { font-size:10.5px; color:var(--text-faint); margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.btn-sm { padding:5px 10px; font-size:11.5px; }
+.dup-badge { display:inline-block; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.03em;
+             background:var(--brown-soft); color:var(--brown); padding:2px 7px; border-radius:999px; }
+.pick-card { position:relative; }
+.pick-dup-btn { position:absolute; top:2px; right:2px; background:var(--bg-elev); border:1px solid var(--border);
+                border-radius:6px; font-size:9.5px; padding:2px 5px; cursor:pointer; color:var(--text-faint); }
+.pick-dup-btn:hover { color:var(--danger); border-color:var(--danger-soft); }
 </style>"""
     body = f"""
 <a class="back" href="{mount}/">&larr; All spreads</a>
@@ -312,10 +335,21 @@ document.querySelectorAll('.swap-btn').forEach(swapBtn => {{
         return;
       }}
       pickerGrid.innerHTML = data.candidates.map(c =>
-        '<button type="button" class="pick-card" data-filename="' + c.filename + '">' +
+        '<div class="pick-card" data-filename="' + c.filename + '">' +
+        '<button type="button" class="pick-dup-btn" data-filename="' + c.filename + '" title="Mark as duplicate -- hides it from swap suggestions">Duplicate?</button>' +
         '<img src="{mount}/photo_thumb/' + encodeURIComponent(c.filename) + '" loading="lazy">' +
-        '<div>' + (c.event_tag || '') + '</div></button>'
+        '<div>' + (c.event_tag || '') + '</div></div>'
       ).join('');
+      pickerGrid.querySelectorAll('.pick-dup-btn').forEach(dupBtn => {{
+        dupBtn.addEventListener('click', (e) => {{
+          e.stopPropagation();
+          const filename = dupBtn.dataset.filename;
+          dupBtn.disabled = true;
+          fetch('{mount}/photo/' + encodeURIComponent(filename) + '/duplicate?value=1', {{method: 'POST'}}).then(() => {{
+            dupBtn.closest('.pick-card').remove();
+          }});
+        }});
+      }});
       pickerGrid.querySelectorAll('.pick-card').forEach(card => {{
         card.addEventListener('click', () => {{
           const fd = new URLSearchParams();
@@ -330,6 +364,14 @@ document.querySelectorAll('.swap-btn').forEach(swapBtn => {{
 }});
 document.getElementById('pickerCloseBtn').addEventListener('click', () => pickerOverlay.classList.remove('show'));
 pickerOverlay.addEventListener('click', (e) => {{ if (e.target === pickerOverlay) pickerOverlay.classList.remove('show'); }});
+document.querySelectorAll('.dup-toggle-btn').forEach(dupBtn => {{
+  dupBtn.addEventListener('click', () => {{
+    const filename = dupBtn.dataset.filename;
+    const newValue = dupBtn.dataset.dup === '1' ? '0' : '1';
+    dupBtn.disabled = true;
+    fetch('{mount}/photo/' + encodeURIComponent(filename) + '/duplicate?value=' + newValue, {{method: 'POST'}}).then(() => location.reload());
+  }});
+}});
 """)
     return web_theme.page_shell(
         "/editor/", f"Spread {spread_number}", f"{spread.get('layout')} &middot; {'locked' if locked else 'unlocked'}",
@@ -416,7 +458,7 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
                     n = int(path.rsplit("/", 1)[-1])
                 except ValueError:
                     self.send_response(400); self.end_headers(); return
-                body = _render_detail(spreads_path, n, mount, out_dir)
+                body = _render_detail(spreads_path, n, mount, out_dir, db_path)
                 if body is None:
                     self.send_response(404); self.end_headers(); return
                 self._send_bytes(body, "text/html; charset=utf-8")
@@ -517,6 +559,19 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, out_dir: str,
         def do_POST(self):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
+
+            if path.startswith("/photo/") and path.endswith("/duplicate"):
+                filename = urllib.parse.unquote(path[len("/photo/"):-len("/duplicate")].strip("/"))
+                qs = urllib.parse.parse_qs(parsed.query)
+                mark = qs.get("value", ["1"])[0] == "1"
+                conn = connect(db_path)
+                try:
+                    conn.execute("UPDATE photos SET is_duplicate = ? WHERE filename = ?", (1 if mark else 0, filename))
+                    conn.commit()
+                finally:
+                    conn.close()
+                self._send_bytes(b'{"ok": true}', "application/json")
+                return
 
             if path == "/regenerate_all":
                 spreads = _load_json(spreads_path)

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS photos (
     event_tag           TEXT,              -- Qwen3-VL scene/event classification, free text
     album_value         REAL,              -- Qwen3-VL judged album-worthiness, 1-10
     is_qwen_candidate   INTEGER DEFAULT 0, -- 1 if selected to run through Qwen (best-per-moment + singles)
-    selection_score     REAL
+    selection_score     REAL,
+    is_duplicate        INTEGER NOT NULL DEFAULT 0  -- user-marked duplicate; excluded from swap candidates
 );
 
 CREATE INDEX IF NOT EXISTS idx_photos_datetime ON photos(datetime_orig);
@@ -83,6 +84,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE photos ADD COLUMN event_tag TEXT")
         conn.execute("ALTER TABLE photos ADD COLUMN album_value REAL")
         conn.execute("ALTER TABLE photos ADD COLUMN is_qwen_candidate INTEGER DEFAULT 0")
+        conn.commit()
+
+    if "is_duplicate" not in cols:
+        conn.execute("ALTER TABLE photos ADD COLUMN is_duplicate INTEGER NOT NULL DEFAULT 0")
         conn.commit()
 
     people_cols = {row[1] for row in conn.execute("PRAGMA table_info(people)")}

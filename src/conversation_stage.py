@@ -48,7 +48,7 @@ def candidate_pool(conn, spread: dict, limit: int = 12) -> list[dict]:
     event = spread.get("event")
     rows = conn.execute(
         "SELECT filename, event_tag, album_value, ai_description FROM photos "
-        "WHERE event_tag = ? AND filename NOT IN ({}) "
+        "WHERE event_tag = ? AND is_duplicate = 0 AND filename NOT IN ({}) "
         "ORDER BY album_value IS NULL, album_value DESC LIMIT ?".format(
             ",".join("?" * len(used)) if used else "''"
         ),
