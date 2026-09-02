@@ -628,4 +628,11 @@ if __name__ == "__main__":
     parser.add_argument("--source-dir", default="")
     parser.add_argument("--port", type=int, default=8002)
     args = parser.parse_args()
-    run(args.db, args.exports, args.source_dir, args.port)
+    # See the matching comment in app.py's __main__ -- stage subprocesses always run with
+    # cwd=REPO_ROOT, so relative paths here must be resolved against it too, not whatever
+    # cwd this process happened to be launched from.
+    db_arg = Path(args.db)
+    exports_arg = Path(args.exports)
+    run(str(db_arg if db_arg.is_absolute() else REPO_ROOT / db_arg),
+        str(exports_arg if exports_arg.is_absolute() else REPO_ROOT / exports_arg),
+        args.source_dir, args.port)

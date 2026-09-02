@@ -22,6 +22,7 @@ import threading
 import webbrowser
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import export_app
 import label_people_app
@@ -225,5 +226,21 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
-    run(args.db, args.exports, args.source_dir, args.spreads, args.crops, args.rendered_dir,
-        args.out_pdf, args.size, args.style, args.port, open_browser=not args.no_browser)
+
+    # Every stage subprocess runs with cwd=project_app.REPO_ROOT regardless of where this
+    # process itself was launched from (project_app._run_stage_blocking hardcodes it so a
+    # stage never depends on the caller's cwd). But these six path args default to relative
+    # strings like "exports/spreads.json" -- if this process's own cwd isn't REPO_ROOT too
+    # (e.g. launched from an IDE run config, or `python src\app.py` from inside src\), the
+    # screens here would resolve them against a different directory than the one stages
+    # actually write to: a stage reports success but the screen that reads its output keeps
+    # saying "not ready". Resolving to absolute paths against REPO_ROOT up front makes both
+    # sides agree no matter the launch cwd. Fixed 2026-09-02 after user reports of Storyboard
+    # and People staying on "not ready"/empty despite their stage completing.
+    def _abs(p: str) -> str:
+        path = Path(p)
+        return str(path if path.is_absolute() else (project_app.REPO_ROOT / path))
+
+    run(_abs(args.db), _abs(args.exports), args.source_dir, _abs(args.spreads), _abs(args.crops),
+        _abs(args.rendered_dir), _abs(args.out_pdf), args.size, args.style, args.port,
+        open_browser=not args.no_browser)

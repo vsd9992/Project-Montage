@@ -37,7 +37,7 @@ def build_shortlist(conn, target_count: int) -> list[tuple]:
     cols = "filename, event_tag, datetime_orig, quality_score, album_value, selection_score"
 
     all_candidates = cur.execute(
-        f"SELECT {cols} FROM photos WHERE selection_score IS NOT NULL "
+        f"SELECT {cols} FROM photos WHERE selection_score IS NOT NULL AND is_duplicate = 0 "
         "ORDER BY selection_score DESC"
     ).fetchall()
     total = len(all_candidates)

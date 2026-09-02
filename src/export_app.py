@@ -105,9 +105,13 @@ if (btn) {
         btn.disabled = false;
         return;
       }
-      document.getElementById('exportStatus').textContent = data.ok
-        ? ('Exported ' + data.pages + ' pages to ' + data.out + '. Project data cleared -- ready for the next project.')
-        : ('Failed: ' + data.error);
+      if (data.ok) {
+        document.getElementById('exportStatus').textContent =
+          'Exported ' + data.pages + ' pages to ' + data.out + '. Project data cleared -- returning to Setup to start a new project\\u2026';
+        setTimeout(() => { window.location.href = '/'; }, 2500);
+        return;
+      }
+      document.getElementById('exportStatus').textContent = 'Failed: ' + data.error;
       btn.disabled = false;
     }).catch(() => {
       document.getElementById('exportStatus').textContent = 'Export failed (network error).';
