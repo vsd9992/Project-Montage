@@ -36,8 +36,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import web_theme
+from conversation_stage import propose_setup_edits
 from db import connect
 from layout_geometry import ORIENTATIONS, PRINT_SIZE_LABELS, PRINT_SIZES
+from qwen_stage import start_server, stop_server
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -251,6 +253,44 @@ STAGE_GROUP_CSS = """
 .stage-group-title{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--text-faint);margin-bottom:2px;}
 """
 
+# Chat widget shared by every screen (Setup/People/Storyboard/Editor), per user request
+# (2026-09-02): "i think we should have the chat option at each screen to make it more
+# usable at each and every stage". Each screen's own module defines what the proposed
+# `ops` mean and how to render/apply them (they're different shapes per screen -- slot
+# swaps, cluster renames, spread moves, size/orientation) but shares this CSS + the
+# request/response plumbing pattern.
+CHAT_CSS = """
+.chat{padding:1em 1.2em;max-width:42em;}
+.chat .hint{font-size:0.85em;color:var(--text-faint);}
+#chatStatus{margin-top:0.5em;color:var(--emerald-strong);font-weight:600;}
+#chatProposal ul{padding-left:1.2em;}
+"""
+
+
+def make_llama_lifecycle(engine_state: dict | None):
+    """Lazy-load-on-first-use, release-right-after llama-server helper (idea §21
+    load/batch/unload), shared shape used by every screen's chat endpoint so the model
+    isn't kept resident between screens. Returns (ensure_fn, release_fn, proc_ref)."""
+    proc_ref = {"proc": None}
+    state = engine_state if engine_state is not None else {}
+
+    def ensure():
+        if proc_ref["proc"] is None:
+            state["state"] = "loading"
+            try:
+                proc_ref["proc"] = start_server()
+            finally:
+                state["state"] = "ready" if proc_ref["proc"] is not None else "idle"
+
+    def release():
+        proc = proc_ref["proc"]
+        if proc is not None:
+            proc_ref["proc"] = None
+            state["state"] = "idle"
+            stop_server(proc)
+
+    return ensure, release, proc_ref
+
 # One Start/Pause pair per step (not per stage), per user request (2026-09-02): "each stage
 # doesn't need its own start and pause button... each step needs its own start/pause and
 # stop (stop works globally)". Start runs every stage in the group in order, stopping on
@@ -365,6 +405,7 @@ def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str, or
 form.config{{display:flex;flex-wrap:wrap;align-items:center;gap:10px;}}
 form.config input[type=text]{{flex:1;min-width:220px;}}
 {STAGE_GROUP_CSS}
+{CHAT_CSS}
 </style>"""
     body = f"""
 <div class="stat-row">
@@ -405,6 +446,17 @@ form.config input[type=text]{{flex:1;min-width:220px;}}
 </div>
 
 {stage_group_html(SETUP_STAGES, "Setup stages")}
+
+<div class="chat card">
+  <h3 style="font-size:14px;">Ask for a change</h3>
+  <p class="hint">e.g. "use 12x24 landscape" -- only print size and orientation can be set from here.</p>
+  <form id="chatForm" style="display:flex;gap:8px;">
+    <input type="text" id="chatInput" placeholder="Describe the change you want" style="flex:1;">
+    <button type="submit" class="btn btn-primary">Ask</button>
+  </form>
+  <div id="chatStatus"></div>
+  <div id="chatProposal"></div>
+</div>
 """
     extra_script = ("""
 document.getElementById('sourceInput').addEventListener('change', () => {
@@ -442,12 +494,47 @@ function pollSetupStats() {
 }
 setInterval(pollSetupStats, 1500);
 pollSetupStats();
+const chatForm = document.getElementById('chatForm');
+if (chatForm) {
+  chatForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const instruction = document.getElementById('chatInput').value.trim();
+    if (!instruction) return;
+    const status = document.getElementById('chatStatus');
+    const proposal = document.getElementById('chatProposal');
+    status.textContent = 'Thinking... (first request loads the model, can take a minute)';
+    proposal.innerHTML = '';
+    fetch('/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({instruction}),
+    }).then(r => r.json()).then(data => {
+      if (!data.ops || data.ops.length === 0) {
+        status.textContent = 'No change proposed for that instruction.';
+        return;
+      }
+      status.textContent = 'Proposed ' + data.ops.length + ' change(s):';
+      const describe = op => op.op === 'set_size' ? ('Print size → ' + op.size)
+        : ('Orientation → ' + op.orientation);
+      proposal.innerHTML = '<ul>' + data.ops.map(op => '<li>' + describe(op) + '</li>').join('') +
+        '</ul><button id="applyBtn" class="btn btn-primary">Apply</button>';
+      document.getElementById('applyBtn').addEventListener('click', () => {
+        status.textContent = 'Applying...';
+        fetch('/chat/apply', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ops: data.ops}),
+        }).then(r => { if (r.ok) location.reload(); else status.textContent = 'Failed to apply.'; });
+      });
+    }).catch(() => { status.textContent = 'Request failed.'; });
+  });
+}
 """ + STAGE_GROUP_SCRIPT)
     return web_theme.page_shell("/", "Setup", "Choose photos & print size, then run the early pipeline stages",
                                  body, extra_head, extra_script)
 
 
-def make_handler(db_path: str, exports_dir: str, state: dict):
+def make_handler(db_path: str, exports_dir: str, state: dict, engine_state: dict | None = None):
+    ensure_llama, release_llama, _ = make_llama_lifecycle(engine_state)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -575,6 +662,38 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 if value not in ORIENTATIONS:
                     self.send_response(400); self.end_headers(); return
                 state["orientation"] = value
+                self._accept()
+                return
+
+            if path == "/chat":
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    fields = json.loads(self.rfile.read(length).decode("utf-8"))
+                except json.JSONDecodeError:
+                    self.send_response(400); self.end_headers(); return
+                instruction = (fields.get("instruction") or "").strip()
+                if not instruction:
+                    self._send_json(b'{"ops": []}')
+                    return
+                ensure_llama()
+                try:
+                    ops = propose_setup_edits(instruction)
+                finally:
+                    release_llama()
+                self._send_json(json.dumps({"ops": ops}).encode("utf-8"))
+                return
+
+            if path == "/chat/apply":
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    fields = json.loads(self.rfile.read(length).decode("utf-8"))
+                except json.JSONDecodeError:
+                    self.send_response(400); self.end_headers(); return
+                for op in fields.get("ops") or []:
+                    if op.get("op") == "set_size" and op.get("size") in PRINT_SIZES:
+                        state["size"] = op["size"]
+                    elif op.get("op") == "set_orientation" and op.get("orientation") in ORIENTATIONS:
+                        state["orientation"] = op["orientation"]
                 self._accept()
                 return
 

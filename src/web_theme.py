@@ -25,6 +25,7 @@ per user 2026-09-01).
 """
 
 import html
+import json
 
 # The step order IS the workflow: Dashboard (setup + run pipeline) -> Storyboard -> People
 # -> Spread Editor -> Export -- matching the pipeline's actual checkpoint order (spread
@@ -216,6 +217,8 @@ function pollEngine() {{
 setInterval(pollEngine, 3000);
 pollEngine();
 
+const __ownPrefix = {json.dumps(active_prefix)};
+let __ownWasReady = null;
 function pollNavReady() {{
   fetch('/status').then(r => r.json()).then(data => {{
     if (data.ready) {{
@@ -233,6 +236,19 @@ function pollNavReady() {{
           }});
         }}
       }});
+      // Reload the current screen once its own data becomes ready, so a stage
+      // finishing while the user is already sitting on the screen it feeds
+      // (e.g. Storyboard while Spread planning is still running) doesn't leave
+      // stale/empty content behind until a manual reload. Reported 2026-09-02.
+      if (__ownPrefix in data.ready) {{
+        const nowReady = data.ready[__ownPrefix] !== false;
+        if (__ownWasReady === null) {{
+          __ownWasReady = nowReady;
+        }} else if (nowReady && !__ownWasReady) {{
+          __ownWasReady = nowReady;
+          window.location.reload();
+        }}
+      }}
     }}
 
     // Any running pipeline stage is shown + stoppable from every screen, not just Setup,

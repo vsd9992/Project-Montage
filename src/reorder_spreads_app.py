@@ -27,8 +27,9 @@ from PIL import Image, ImageOps
 
 import project_app
 import web_theme
+from conversation_stage import propose_storyboard_edits
 from db import connect
-from reorder_spreads import apply_reorder
+from reorder_spreads import apply_reorder, move_spread
 
 DB_PATH = "cache/project_full.db"
 SPREADS_PATH = "exports/spreads.json"
@@ -82,6 +83,7 @@ def _render_index(spreads_path: str, mount: str) -> bytes:
 .meta {{ font-size: 0.85em; margin-top: 0.5em; color: var(--text-muted); }}
 #status {{ margin-bottom: 1em; color: var(--emerald-strong); font-weight: 600; min-height: 1.2em; }}
 {project_app.STAGE_GROUP_CSS}
+{project_app.CHAT_CSS}
 </style>"""
     body = f"""
 {project_app.stage_group_html(project_app.STORYBOARD_STAGES, "Storyboard stage")}
@@ -90,6 +92,18 @@ automatically on drop (re-render afterwards to produce the reordered album pages
 <div id="status"></div>
 <div class="grid" id="grid">
 {''.join(cards)}
+</div>
+
+<div class="chat card">
+  <h3 style="font-size:14px;">Ask for a change</h3>
+  <p class="hint">e.g. "move spread 4 to the end" or "put spread 7 first" -- only reordering
+  whole spreads is possible from here.</p>
+  <form id="chatForm" style="display:flex;gap:8px;">
+    <input type="text" id="chatInput" placeholder="Describe the change you want" style="flex:1;">
+    <button type="submit" class="btn btn-primary">Ask</button>
+  </form>
+  <div id="chatStatus"></div>
+  <div id="chatProposal"></div>
 </div>"""
     extra_script = ("""
 const grid = document.getElementById('grid');
@@ -135,6 +149,38 @@ function saveOrder() {
     else { status.textContent = 'Save failed (' + r.status + ')'; }
   }).catch(() => { status.textContent = 'Save failed (network error)'; });
 }
+const chatForm = document.getElementById('chatForm');
+if (chatForm) {
+  chatForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const instruction = document.getElementById('chatInput').value.trim();
+    if (!instruction) return;
+    const cstatus = document.getElementById('chatStatus');
+    const proposal = document.getElementById('chatProposal');
+    cstatus.textContent = 'Thinking... (first request loads the model, can take a minute)';
+    proposal.innerHTML = '';
+    fetch('""" + mount + """/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({instruction}),
+    }).then(r => r.json()).then(data => {
+      if (!data.ops || data.ops.length === 0) {
+        cstatus.textContent = 'No change proposed for that instruction.';
+        return;
+      }
+      cstatus.textContent = 'Proposed ' + data.ops.length + ' change(s):';
+      proposal.innerHTML = '<ul>' + data.ops.map(op =>
+        '<li>Move spread ' + op.spread + ' to position ' + op.to_position + '</li>').join('') +
+        '</ul><button id="applyBtn" class="btn btn-primary">Apply</button>';
+      document.getElementById('applyBtn').addEventListener('click', () => {
+        cstatus.textContent = 'Applying...';
+        fetch('""" + mount + """/chat/apply', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ops: data.ops}),
+        }).then(r => { if (r.ok) location.reload(); else cstatus.textContent = 'Failed to apply.'; });
+      });
+    }).catch(() => { cstatus.textContent = 'Request failed.'; });
+  });
+}
 """ + project_app.STAGE_GROUP_SCRIPT)
     return web_theme.page_shell(
         "/storyboard/", "Storyboard", f"{len(spreads)} spreads &mdash; drag to reorder", body, extra_head, extra_script,
@@ -160,7 +206,10 @@ def _spread_thumb_jpeg(conn: sqlite3.Connection, spreads_path: str, spread_numbe
     return buf.getvalue()
 
 
-def make_handler(db_path: str, spreads_path: str, crops_path: str, mount: str = ""):
+def make_handler(db_path: str, spreads_path: str, crops_path: str, mount: str = "",
+                  engine_state: dict | None = None):
+    ensure_llama, release_llama, _ = project_app.make_llama_lifecycle(engine_state)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -199,7 +248,61 @@ def make_handler(db_path: str, spreads_path: str, crops_path: str, mount: str = 
             self.send_response(404)
             self.end_headers()
 
+        def _send_json(self, body: bytes, status: int = 200):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self):
+            if self.path == "/chat":
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    fields = json.loads(self.rfile.read(length).decode("utf-8"))
+                except json.JSONDecodeError:
+                    self.send_response(400); self.end_headers(); return
+                instruction = (fields.get("instruction") or "").strip()
+                if not instruction or not Path(spreads_path).exists():
+                    self._send_json(b'{"ops": []}')
+                    return
+                spreads = _load_spreads(spreads_path)
+                ensure_llama()
+                try:
+                    ops = propose_storyboard_edits(spreads, instruction)
+                finally:
+                    release_llama()
+                self._send_json(json.dumps({"ops": ops}).encode("utf-8"))
+                return
+
+            if self.path == "/chat/apply":
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    fields = json.loads(self.rfile.read(length).decode("utf-8"))
+                except json.JSONDecodeError:
+                    self.send_response(400); self.end_headers(); return
+                spreads = _load_spreads(spreads_path)
+                current_numbers = [s["spread"] for s in sorted(spreads, key=lambda s: s["spread"])]
+                for op in fields.get("ops") or []:
+                    if op.get("op") != "move_spread":
+                        continue
+                    spread, to_position = op.get("spread"), op.get("to_position")
+                    if spread not in current_numbers:
+                        continue
+                    current_numbers = move_spread(current_numbers, spread, to_position)
+                try:
+                    apply_reorder(spreads_path, crops_path, current_numbers, spreads_path, crops_path)
+                except (ValueError, FileNotFoundError) as e:
+                    self.send_response(400)
+                    msg = str(e).encode("utf-8")
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    self.wfile.write(msg)
+                    return
+                self._send_json(b"{}")
+                return
+
             if self.path != "/reorder":
                 self.send_response(404)
                 self.end_headers()

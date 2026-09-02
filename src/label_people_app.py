@@ -20,6 +20,7 @@ Two features beyond basic labeling, added after user feedback (2026-09-01):
 import argparse
 import html
 import io
+import json
 import sqlite3
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +29,7 @@ from PIL import Image, ImageOps
 
 import project_app
 import web_theme
+from conversation_stage import build_people_context, propose_people_edits
 from db import connect
 
 DB_PATH = "cache/project_full.db"
@@ -89,6 +91,7 @@ def _render_index(conn: sqlite3.Connection, mount: str) -> bytes:
 details{{margin-top:8px;}}
 details summary{{cursor:pointer;font-weight:600;color:var(--text-muted);}}
 {project_app.STAGE_GROUP_CSS}
+{project_app.CHAT_CSS}
 </style>"""
     body = f"""
 {project_app.stage_group_html(project_app.PEOPLE_STAGES, "People stages")}
@@ -101,10 +104,58 @@ them. "Remove" moves a cluster to the list below instead of deleting it &mdash; 
 <div class="grid-fill" style="margin-top:12px;">
 {ignored_html}
 </div>
-</details>"""
+</details>
+
+<div class="chat card">
+  <h3 style="font-size:14px;">Ask for a change</h3>
+  <p class="hint">e.g. "rename person 3 to Bride" or "merge person 5 and person 8 as Groom" or
+  "remove person 12" -- only cluster rename/ignore/restore is possible from here.</p>
+  <form id="chatForm" style="display:flex;gap:8px;">
+    <input type="text" id="chatInput" placeholder="Describe the change you want" style="flex:1;">
+    <button type="submit" class="btn btn-primary">Ask</button>
+  </form>
+  <div id="chatStatus"></div>
+  <div id="chatProposal"></div>
+</div>"""
+    extra_script = ("""
+const chatForm = document.getElementById('chatForm');
+if (chatForm) {
+  chatForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const instruction = document.getElementById('chatInput').value.trim();
+    if (!instruction) return;
+    const status = document.getElementById('chatStatus');
+    const proposal = document.getElementById('chatProposal');
+    status.textContent = 'Thinking... (first request loads the model, can take a minute)';
+    proposal.innerHTML = '';
+    fetch('""" + mount + """/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({instruction}),
+    }).then(r => r.json()).then(data => {
+      if (!data.ops || data.ops.length === 0) {
+        status.textContent = 'No change proposed for that instruction.';
+        return;
+      }
+      status.textContent = 'Proposed ' + data.ops.length + ' change(s):';
+      const describe = op => op.op === 'rename' ? ('Person ' + op.person_id + ' \\u2192 "' + op.label + '"')
+        : op.op === 'ignore' ? ('Remove person ' + op.person_id)
+        : ('Restore person ' + op.person_id);
+      proposal.innerHTML = '<ul>' + data.ops.map(op => '<li>' + describe(op) + '</li>').join('') +
+        '</ul><button id="applyBtn" class="btn btn-primary">Apply</button>';
+      document.getElementById('applyBtn').addEventListener('click', () => {
+        status.textContent = 'Applying...';
+        fetch('""" + mount + """/chat/apply', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ops: data.ops}),
+        }).then(r => { if (r.ok) location.reload(); else status.textContent = 'Failed to apply.'; });
+      });
+    }).catch(() => { status.textContent = 'Request failed.'; });
+  });
+}
+""" + project_app.STAGE_GROUP_SCRIPT)
     return web_theme.page_shell(
         "/people/", "People", f"{len(active)} active clusters, {len(ignored)} removed",
-        body, extra_head, project_app.STAGE_GROUP_SCRIPT,
+        body, extra_head, extra_script,
     )
 
 
@@ -163,7 +214,9 @@ def _save_label(conn: sqlite3.Connection, person_id: int, label: str | None) -> 
     conn.commit()
 
 
-def make_handler(db_path: str, mount: str = ""):
+def make_handler(db_path: str, mount: str = "", engine_state: dict | None = None):
+    ensure_llama, release_llama, _ = project_app.make_llama_lifecycle(engine_state)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -196,7 +249,62 @@ def make_handler(db_path: str, mount: str = ""):
             finally:
                 conn.close()
 
+        def _send_json(self, body: bytes, status: int = 200):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self):
+            if self.path == "/chat":
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    fields = json.loads(self.rfile.read(length).decode("utf-8"))
+                except json.JSONDecodeError:
+                    self.send_response(400); self.end_headers(); return
+                instruction = (fields.get("instruction") or "").strip()
+                if not instruction:
+                    self._send_json(b'{"ops": []}')
+                    return
+                conn = connect(db_path)
+                try:
+                    ensure_llama()
+                    try:
+                        ops = propose_people_edits(conn, instruction)
+                    finally:
+                        release_llama()
+                finally:
+                    conn.close()
+                self._send_json(json.dumps({"ops": ops}).encode("utf-8"))
+                return
+
+            if self.path == "/chat/apply":
+                length = int(self.headers.get("Content-Length", 0))
+                try:
+                    fields = json.loads(self.rfile.read(length).decode("utf-8"))
+                except json.JSONDecodeError:
+                    self.send_response(400); self.end_headers(); return
+                conn = connect(db_path)
+                try:
+                    people = {p["person_id"]: p for p in build_people_context(conn)}
+                    for op in fields.get("ops") or []:
+                        person_id = op.get("person_id")
+                        if person_id not in people:
+                            continue
+                        if op.get("op") == "rename":
+                            _save_label(conn, person_id, op.get("label"))
+                        elif op.get("op") == "ignore":
+                            conn.execute("UPDATE people SET ignored = 1 WHERE person_id = ?", (person_id,))
+                            conn.commit()
+                        elif op.get("op") == "restore":
+                            conn.execute("UPDATE people SET ignored = 0 WHERE person_id = ?", (person_id,))
+                            conn.commit()
+                finally:
+                    conn.close()
+                self._send_json(b"{}")
+                return
+
             parts = self.path.strip("/").split("/")
             if len(parts) != 2 or parts[0] not in ("label", "ignore", "restore"):
                 self.send_response(404)

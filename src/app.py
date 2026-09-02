@@ -140,14 +140,14 @@ def run(db_path: str, exports_dir: str, source_dir: str, spreads_path: str, crop
 
     dashboard = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_DASHBOARD),
-        project_app.make_handler(db_path, exports_dir, project_state),
+        project_app.make_handler(db_path, exports_dir, project_state, engine_state),
     )
     people = ThreadingHTTPServer(
-        ("127.0.0.1", _PORT_PEOPLE), label_people_app.make_handler(db_path, "/people"),
+        ("127.0.0.1", _PORT_PEOPLE), label_people_app.make_handler(db_path, "/people", engine_state),
     )
     storyboard = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_STORYBOARD),
-        reorder_spreads_app.make_handler(db_path, spreads_path, crops_path, "/storyboard"),
+        reorder_spreads_app.make_handler(db_path, spreads_path, crops_path, "/storyboard", engine_state),
     )
     editor = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_EDITOR),

@@ -16,7 +16,23 @@ import re
 
 import requests
 
+from layout_geometry import ORIENTATIONS, PRINT_SIZES
 from qwen_stage import BASE_URL
+
+
+def _call_model(system_prompt: str, user_message: str, max_tokens: int = 300) -> str:
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    r = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=120)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
 
 SYSTEM_PROMPT = (
     "You are a layout assistant for a printed photo album. You are given one spread "
@@ -122,16 +138,157 @@ def propose_edits(conn, spread: dict, instruction: str) -> list[dict]:
     qwen_stage.start_server/stop_server) and returns validated swap_slot ops."""
     pool = candidate_pool(conn, spread)
     user_message = build_user_message(conn, spread, instruction, pool)
-    payload = {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        "max_tokens": 300,
-        "temperature": 0.2,
-    }
-    r = requests.post(f"{BASE_URL}/v1/chat/completions", json=payload, timeout=120)
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"]
+    content = _call_model(SYSTEM_PROMPT, user_message)
     ops = parse_ops_response(content)
     return validate_ops(ops, spread, pool)
+
+
+# --- People screen chat (idea §18 extended to every stage, per user request 2026-09-02) ---
+
+PEOPLE_SYSTEM_PROMPT = (
+    "You help the user manage face clusters on a photo album's People screen. You are "
+    "given a list of clusters (person_id, current label, face count, whether ignored) and "
+    "the user's instruction. You may ONLY propose these operations: "
+    '{"op": "rename", "person_id": <int>, "label": "<new name>"}, '
+    '{"op": "ignore", "person_id": <int>} (deprioritize a cluster, e.g. a random guest), '
+    '{"op": "restore", "person_id": <int>} (undo ignore). '
+    "Naming two clusters the same label merges them -- that's expected, just propose two "
+    "rename ops with the same label if the user asks to merge or says two clusters are the "
+    "same person. Respond with ONLY a JSON object (no markdown, no extra text): "
+    '{"ops": [...]}. Use an empty ops list if the instruction doesn\'t map to a sensible '
+    "operation. Only use person_id values that appear in the input."
+)
+
+
+def build_people_context(conn) -> list[dict]:
+    rows = conn.execute(
+        "SELECT p.person_id, p.label, p.ignored, COUNT(f.id) AS face_count "
+        "FROM people p JOIN faces f ON f.person_id = p.person_id "
+        "GROUP BY p.person_id ORDER BY face_count DESC"
+    ).fetchall()
+    return [
+        {"person_id": r[0], "label": r[1] or "", "ignored": bool(r[2]), "face_count": r[3]}
+        for r in rows
+    ]
+
+
+def build_people_user_message(people: list[dict], instruction: str) -> str:
+    lines = [
+        f"  person_id={p['person_id']} label=\"{p['label']}\" faces={p['face_count']}"
+        f"{' (ignored)' if p['ignored'] else ''}"
+        for p in people
+    ]
+    return "Clusters:\n" + ("\n".join(lines) if lines else "  (none)") + f"\nUser instruction: {instruction}"
+
+
+def validate_people_ops(ops: list[dict], people: list[dict]) -> list[dict]:
+    valid_ids = {p["person_id"] for p in people}
+    valid = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        kind = op.get("op")
+        if kind not in ("rename", "ignore", "restore"):
+            continue
+        if op.get("person_id") not in valid_ids:
+            continue
+        entry = {"op": kind, "person_id": op["person_id"]}
+        if kind == "rename":
+            label = op.get("label")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            entry["label"] = label.strip()
+        valid.append(entry)
+    return valid
+
+
+def propose_people_edits(conn, instruction: str) -> list[dict]:
+    people = build_people_context(conn)
+    content = _call_model(PEOPLE_SYSTEM_PROMPT, build_people_user_message(people, instruction))
+    return validate_people_ops(parse_ops_response(content), people)
+
+
+# --- Storyboard screen chat ---
+
+STORYBOARD_SYSTEM_PROMPT = (
+    "You help the user reorder spreads on a photo album's Storyboard screen. You are given "
+    "the current sequence of spreads (number, event, layout, photo count) and the user's "
+    "instruction. You may ONLY propose moving one spread to a new 1-indexed position: "
+    '{"op": "move_spread", "spread": <int>, "to_position": <int>}. You cannot merge, '
+    "delete, or change what's inside a spread. Respond with ONLY a JSON object (no "
+    'markdown, no extra text): {"ops": [...]}. Use an empty ops list if the instruction '
+    "doesn't map to a sensible move. Only use spread numbers that appear in the input, and "
+    "to_position must be between 1 and the total number of spreads."
+)
+
+
+def build_storyboard_context(spreads: list[dict]) -> list[dict]:
+    return [
+        {
+            "spread": s["spread"], "event": s.get("event") or "",
+            "layout": s.get("layout") or "",
+            "photos": len(s.get("supporting") or []) + (1 if s.get("hero") else 0),
+        }
+        for s in sorted(spreads, key=lambda s: s["spread"])
+    ]
+
+
+def build_storyboard_user_message(spreads: list[dict], instruction: str) -> str:
+    lines = [
+        f"  spread={s['spread']} event=\"{s['event']}\" layout={s['layout']} photos={s['photos']}"
+        for s in build_storyboard_context(spreads)
+    ]
+    return "Current order:\n" + "\n".join(lines) + f"\nUser instruction: {instruction}"
+
+
+def validate_storyboard_ops(ops: list[dict], spreads: list[dict]) -> list[dict]:
+    valid_numbers = {s["spread"] for s in spreads}
+    n = len(spreads)
+    valid = []
+    for op in ops:
+        if not isinstance(op, dict) or op.get("op") != "move_spread":
+            continue
+        spread, to_position = op.get("spread"), op.get("to_position")
+        if spread not in valid_numbers:
+            continue
+        if not isinstance(to_position, int) or not (1 <= to_position <= n):
+            continue
+        valid.append({"op": "move_spread", "spread": spread, "to_position": to_position})
+    return valid
+
+
+def propose_storyboard_edits(spreads: list[dict], instruction: str) -> list[dict]:
+    content = _call_model(STORYBOARD_SYSTEM_PROMPT, build_storyboard_user_message(spreads, instruction))
+    return validate_storyboard_ops(parse_ops_response(content), spreads)
+
+
+# --- Setup screen chat ---
+
+SETUP_SYSTEM_PROMPT = (
+    "You help the user configure the Setup screen of a photo album tool before the "
+    "pipeline runs. You may ONLY propose these operations: "
+    '{"op": "set_size", "size": "<print size>"}, {"op": "set_orientation", "orientation": '
+    '"landscape"|"portrait"}. Valid print sizes: ' + ", ".join(PRINT_SIZES) + ". "
+    "Respond with ONLY a JSON object (no markdown, no extra text): "
+    '{"ops": [...]}. Use an empty ops list if the instruction doesn\'t map to a sensible '
+    "operation (e.g. it's about something this screen doesn't control, like importing "
+    "photos or changing photo content)."
+)
+
+
+def validate_setup_ops(ops: list[dict]) -> list[dict]:
+    valid = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        kind = op.get("op")
+        if kind == "set_size" and op.get("size") in PRINT_SIZES:
+            valid.append({"op": "set_size", "size": op["size"]})
+        elif kind == "set_orientation" and op.get("orientation") in ORIENTATIONS:
+            valid.append({"op": "set_orientation", "orientation": op["orientation"]})
+    return valid
+
+
+def propose_setup_edits(instruction: str) -> list[dict]:
+    content = _call_model(SETUP_SYSTEM_PROMPT, f"User instruction: {instruction}")
+    return validate_setup_ops(parse_ops_response(content))
