@@ -76,9 +76,14 @@ See [Roadmap](#roadmap--current-status) for exactly what's done vs. planned.
   separate from layout, so changing style never touches slot geometry.
 - **Editable, not a black box.** Every spread can be locked, regenerated individually or
   in bulk, or hand-edited slot by slot — automation proposes, you decide.
-- **Conversational editing.** Type an instruction on a spread ("use fewer photos here",
-  "these two look repetitive") and a local VLM proposes a small, reviewable set of slot
-  swaps you approve or discard — it never touches pixels directly.
+- **Duplicate marking.** Flag a near-identical repeat from the spread editor's photo
+  picker; marked duplicates are excluded from future shortlist/spread-planning runs, so
+  re-running those stages produces an album without it.
+- **Conversational editing on every screen.** Type a plain-English instruction and a local
+  VLM proposes a small, reviewable set of changes you approve or discard before anything
+  is applied — it never touches pixels directly. Scoped per screen: slot swaps on the
+  Spread Editor ("use fewer photos here"), print size/orientation on Setup, cluster
+  rename/merge/remove on People, and whole-spread reordering on Storyboard.
 - **Print production, not a demo.** Ten print sizes (8×8 through 12×36) in either
   landscape or portrait orientation, 300 DPI target, preflight checks (resolution, missing
   assets) before you export — a native Save As dialog lets you name the PDF and pick where
@@ -139,11 +144,13 @@ never touched.
 Every stage reads/writes a single local SQLite database (`cache/project_full.db`) plus a
 couple of JSON files (`exports/spreads.json`, `exports/crops.json`) that describe the
 current storyboard and crop choices — nothing is baked into rendered pixels until the
-render step, so re-ordering, re-styling, or re-cropping never means starting over. The
-print size/orientation chosen on Setup is persisted to `exports/ui_state.json` so it
-survives an app restart and keeps matching whatever was actually rendered — if it ever
-doesn't (e.g. rendered spreads from an interrupted earlier size), Export's preflight check
-reports which spreads are stale and tells you to re-render before it will let you export.
+render step, so re-ordering, re-styling, or re-cropping never means starting over. The app
+wipes the database and exports folder on every launch, so it always starts from a clean
+slate (your source photo folder is never touched) — the same "Stop & Clear Project"
+control available from any screen mid-session does the same wipe on demand. If chosen
+print size/orientation ever drifts out of sync with what was actually rendered (e.g. size
+changed after rendering, without re-rendering), Export's preflight check reports which
+spreads are stale and tells you to re-render before it will let you export.
 
 ## Components / tech stack
 
@@ -233,8 +240,18 @@ Start button (a screen is greyed out in the step bar until its data exists):
   resulting face clusters.
 - **Spread Editor** — start "Intelligent cropping" then "Render spreads", then swap a
   slot's photo via a photo-picker (click a same-event candidate's thumbnail, no typing
-  filenames), lock a spread, regenerate one or all unlocked spreads, or type a
-  plain-English instruction in the chat panel.
+  filenames), mark a candidate as a duplicate right from the picker, lock a spread,
+  regenerate one or all unlocked spreads, or type a plain-English instruction in the chat
+  panel. To remove a duplicate (or any unwanted photo) from the album entirely: mark it,
+  then re-run Shortlist (Setup) → Spread layout planning (Storyboard) → Face detection/
+  People clustering (People) → Cropping/Render (Spread Editor) — each screen's own Start
+  button re-runs just its stage(s) against the updated shortlist. Note this regenerates
+  `spreads.json` wholesale, so any manual reordering/locks made since the last generation
+  are lost along with it.
+- Every screen above also has its own chat box — type a plain-English request scoped to
+  what that screen controls (e.g. "use 12x24 landscape" on Setup, "merge person 5 and
+  person 8 as Groom" on People, "move spread 4 to the end" on Storyboard) and approve or
+  discard what it proposes before it's applied.
 - **Export** — check the preflight results (resolution, missing assets), then click Export:
   a native Save As dialog lets you name the PDF and choose where it goes. After a
   successful export, the working project database and exports folder are wiped
@@ -291,11 +308,13 @@ SQLite database/exports, model weights, and this project's own AI-agent working 
   revert what later steps already produced — that needs a project-state snapshot/
   versioning mechanism, deferred to Phase 5 rather than half-built (see
   [Roadmap](#roadmap--current-status)).
-- **Conversational editing is deliberately narrow.** It can only swap which photo fills
-  an existing slot, from same-event candidates the model is explicitly shown. It cannot
-  change a spread's layout, slot count, or move a photo to a different spread — those
-  remain manual, hands-on-keyboard edits by design (see `_projectIdea.md` §18: "It
-  shouldn't directly manipulate pixels").
+- **Conversational editing is deliberately narrow, per screen.** On the Spread Editor it
+  can only swap which photo fills an existing slot, from same-event candidates the model
+  is explicitly shown — it cannot change a spread's layout, slot count, or move a photo to
+  a different spread. On Setup it can only set print size/orientation; on People only
+  rename/merge/remove clusters; on Storyboard only reorder whole spreads. Anything outside
+  those specific actions remains a manual, hands-on-keyboard edit by design (see
+  `_projectIdea.md` §18: "It shouldn't directly manipulate pixels").
 - **Not mobile-responsive by design.** The UI is fluid across desktop browser window
   widths, not built for phone-sized screens.
 
