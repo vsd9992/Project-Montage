@@ -81,10 +81,21 @@ _jobs: dict[str, dict] = {}  # key -> {"running", "returncode", "lines", "starte
 _proc_lock = threading.Lock()
 _current_proc = {"proc": None, "key": None}
 
+# One Start/Pause per step screen, chaining that step's stages in order (2026-09-02, user
+# request -- "each stage doesn't need it's own start and pause button... stages in each
+# step can be chained realistically"). `_group_state["running"]` covers the brief gap
+# between one stage finishing and the next one starting, which `_current_proc` alone
+# doesn't (it's briefly empty between stages).
+_group_lock = threading.Lock()
+_group_state = {"running": False, "keys": [], "pause_requested": False, "stop_requested": False}
+
 
 def _any_running() -> bool:
     with _proc_lock:
-        return _current_proc["proc"] is not None
+        proc_busy = _current_proc["proc"] is not None
+    with _group_lock:
+        group_busy = _group_state["running"]
+    return proc_busy or group_busy
 
 
 def _project_status(db_path: str, exports_dir: str) -> dict:
@@ -214,6 +225,28 @@ def _terminate_current() -> None:
                     _jobs[key]["interrupted"] = True
 
 
+def _run_group(keys: list[str], db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> None:
+    with _group_lock:
+        _group_state["running"] = True
+        _group_state["keys"] = list(keys)
+        _group_state["pause_requested"] = False
+        _group_state["stop_requested"] = False
+    for key in keys:
+        with _group_lock:
+            if _group_state["pause_requested"] or _group_state["stop_requested"]:
+                break
+        rc = _run_stage_blocking(key, db_path, exports_dir, source_dir, size, orientation)
+        with _group_lock:
+            stop = _group_state["pause_requested"] or _group_state["stop_requested"]
+        if stop or rc != 0:
+            break
+    with _group_lock:
+        _group_state["running"] = False
+        _group_state["keys"] = []
+        _group_state["pause_requested"] = False
+        _group_state["stop_requested"] = False
+
+
 def _wipe_project(db_path: str, exports_dir: str) -> None:
     p = Path(db_path)
     if p.exists():
@@ -241,9 +274,18 @@ STAGE_GROUP_CSS = """
      padding:8px 10px;margin-top:8px;display:none;white-space:pre-wrap;border-radius:8px;}
 .log.show{display:block;}
 .btn-sm{padding:5px 11px;font-size:12px;}
+.stage-group{margin-bottom:16px;}
+.stage-group-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px;}
+.stage-group-controls{display:flex;align-items:center;gap:8px;}
+.stage-group-status{font-size:11.5px;color:var(--text-faint);}
 .stage-group-title{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--text-faint);margin-bottom:2px;}
 """
 
+# One Start/Pause pair per step (not per stage), per user request (2026-09-02): "each stage
+# doesn't need its own start and pause button... each step needs its own start/pause and
+# stop (stop works globally)". Start runs every stage in the group in order, stopping on
+# the first failure -- Pause terminates whichever stage is currently running and halts the
+# rest of the group. Each stage still gets its own status badge + log underneath.
 STAGE_GROUP_SCRIPT = """
 function pollStageGroup() {
   fetch('/status').then(r => r.json()).then(data => {
@@ -253,11 +295,8 @@ function pollStageGroup() {
       const job = jobs[key];
       const badgeEl = el.querySelector('[data-badge]');
       const logEl = el.querySelector('[data-log]');
-      const startBtn = el.querySelector('[data-start]');
-      const pauseBtn = el.querySelector('[data-pause]');
-      let badge = 'idle', running = false;
+      let badge = 'idle';
       if (job) {
-        running = !!job.running;
         if (job.running) badge = 'running';
         else if (job.interrupted) badge = 'paused';
         else if (job.returncode === 0) badge = 'ok';
@@ -269,11 +308,18 @@ function pollStageGroup() {
       }
       badgeEl.textContent = badge;
       badgeEl.className = 'badge ' + badge;
-      if (startBtn) {
-        startBtn.style.display = running ? 'none' : 'inline-block';
-        startBtn.disabled = !running && data.any_running;
-      }
-      if (pauseBtn) pauseBtn.style.display = running ? 'inline-block' : 'none';
+    });
+    const groupKeys = data.group_keys || [];
+    document.querySelectorAll('.stage-group[data-group-keys]').forEach(group => {
+      const keys = group.dataset.groupKeys.split(',');
+      const groupRunning = (data.group_running && keys.some(k => groupKeys.includes(k)))
+        || keys.some(k => jobs[k] && jobs[k].running);
+      const startBtn = group.querySelector('[data-group-start]');
+      const pauseBtn = group.querySelector('[data-group-pause]');
+      const statusEl = group.querySelector('[data-group-status]');
+      if (startBtn) { startBtn.style.display = groupRunning ? 'none' : 'inline-block'; startBtn.disabled = !groupRunning && data.any_running; }
+      if (pauseBtn) pauseBtn.style.display = groupRunning ? 'inline-block' : 'none';
+      if (statusEl) statusEl.textContent = groupRunning ? 'Running\\u2026' : '';
     });
   });
 }
@@ -288,16 +334,16 @@ document.addEventListener('click', (e) => {
     details.textContent = open ? 'Details' : 'Hide details';
     return;
   }
-  const startBtn = e.target.closest('[data-start]');
+  const startBtn = e.target.closest('[data-group-start]');
   if (startBtn) {
-    const key = startBtn.closest('.stage').dataset.key;
+    const keys = startBtn.closest('.stage-group').dataset.groupKeys;
     startBtn.disabled = true;
-    fetch('/run/' + key, {method: 'POST'}).then(r => {
-      if (!r.ok) return r.json().then(d => alert(d.error || 'Could not start this stage.')).catch(() => alert('Could not start this stage (another stage may already be running).'));
+    fetch('/run-group?keys=' + encodeURIComponent(keys), {method: 'POST'}).then(r => {
+      if (!r.ok) return r.json().then(d => alert(d.error || 'Could not start.')).catch(() => alert('Could not start (another stage may already be running).'));
     }).catch(() => {}).finally(() => { startBtn.disabled = false; });
     return;
   }
-  const pauseBtn = e.target.closest('[data-pause]');
+  const pauseBtn = e.target.closest('[data-group-pause]');
   if (pauseBtn) {
     pauseBtn.disabled = true;
     fetch('/pause', {method: 'POST'}).finally(() => { pauseBtn.disabled = false; });
@@ -318,13 +364,23 @@ def stage_group_html(keys: list[str], title: str = "Pipeline stages") -> str:
           <div class="stage-head">
             <span class="badge idle" data-badge>idle</span>
             <strong>{html.escape(stage['label'])}</strong>
-            <button type="button" class="btn btn-outline btn-sm" data-start>Start</button>
-            <button type="button" class="btn btn-outline btn-sm" data-pause style="display:none;">Pause</button>
             <a href="#" class="details-toggle" data-details-toggle style="font-size:11.5px;color:var(--text-faint);">Details</a>
           </div>
           <pre class="log" data-log></pre>
         </div>""")
-    return f'<div><div class="stage-group-title">{html.escape(title)}</div>{"".join(rows)}</div>'
+    keys_attr = html.escape(",".join(keys))
+    return f"""
+    <div class="stage-group" data-group-keys="{keys_attr}">
+      <div class="stage-group-head">
+        <div class="stage-group-title">{html.escape(title)}</div>
+        <div class="stage-group-controls">
+          <button type="button" class="btn btn-primary btn-sm" data-group-start>Start</button>
+          <button type="button" class="btn btn-outline btn-sm" data-group-pause style="display:none;">Pause</button>
+          <span class="stage-group-status" data-group-status></span>
+        </div>
+      </div>
+      {''.join(rows)}
+    </div>"""
 
 
 def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> bytes:
@@ -342,11 +398,11 @@ form.config input[type=text]{{flex:1;min-width:220px;}}
 </style>"""
     body = f"""
 <div class="stat-row">
-<div class="card stat-tile"><div class="stat-value">{status.get('photos', 0)}</div><div class="stat-label">Photos imported</div></div>
-<div class="card stat-tile"><div class="stat-value">{'&#10003;' if status.get('spreads_json') else '&mdash;'}</div><div class="stat-label">Spreads planned</div></div>
-<div class="card stat-tile"><div class="stat-value">{status.get('people', 0)}</div><div class="stat-label">People found</div></div>
-<div class="card stat-tile"><div class="stat-value">{status.get('rendered_count', 0)}</div><div class="stat-label">Rendered spreads</div></div>
-<div class="card stat-tile"><div class="stat-value">{'&#10003;' if status.get('album_pdf') else '&mdash;'}</div><div class="stat-label">Album PDF</div></div>
+<div class="card stat-tile"><div class="stat-value" id="statPhotos">{status.get('photos', 0)}</div><div class="stat-label">Photos imported</div></div>
+<div class="card stat-tile"><div class="stat-value" id="statSpreads">{'&#10003;' if status.get('spreads_json') else '&mdash;'}</div><div class="stat-label">Spreads planned</div></div>
+<div class="card stat-tile"><div class="stat-value" id="statPeople">{status.get('people', 0)}</div><div class="stat-label">People found</div></div>
+<div class="card stat-tile"><div class="stat-value" id="statRendered">{status.get('rendered_count', 0)}</div><div class="stat-label">Rendered spreads</div></div>
+<div class="card stat-tile"><div class="stat-value" id="statPdf">{'&#10003;' if status.get('album_pdf') else '&mdash;'}</div><div class="stat-label">Album PDF</div></div>
 </div>
 
 <form class="config card" style="padding:14px 18px;" id="sourceForm">
@@ -404,6 +460,18 @@ document.getElementById('newProjectBtn').addEventListener('click', () => {
   if (!confirm('This will permanently DELETE the project database and all exports (photos on disk are untouched). Continue?')) return;
   fetch('/stop-project', {method: 'POST'}).then(() => location.reload());
 });
+function pollSetupStats() {
+  fetch('/status').then(r => r.json()).then(data => {
+    const s = data.stats || {};
+    document.getElementById('statPhotos').textContent = s.photos || 0;
+    document.getElementById('statSpreads').textContent = s.spreads_json ? '\\u2713' : '\\u2014';
+    document.getElementById('statPeople').textContent = s.people || 0;
+    document.getElementById('statRendered').textContent = s.rendered_count || 0;
+    document.getElementById('statPdf').textContent = s.album_pdf ? '\\u2713' : '\\u2014';
+  }).catch(() => {});
+}
+setInterval(pollSetupStats, 1500);
+pollSetupStats();
 """ + STAGE_GROUP_SCRIPT)
     return web_theme.page_shell("/", "Setup", "Choose photos & print size, then run the early pipeline stages",
                                  body, extra_head, extra_script)
@@ -430,14 +498,25 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
             elif parsed.path == "/status":
                 with _jobs_lock:
                     jobs = dict(_jobs)
+                with _group_lock:
+                    group_running = _group_state["running"]
+                    group_keys = list(_group_state["keys"])
                 proj = _project_status(db_path, exports_dir)
+                # Gated on the *prerequisite* for a screen's own stage(s), not on that
+                # stage's own output -- gating "/storyboard/" on spreads_json (its own
+                # output) made it impossible to ever reach the screen that produces
+                # spreads_json in the first place. Fixed 2026-09-02 after this locked users
+                # out of Storyboard/People/Editor even once the prior screen's work was done.
                 ready = {
-                    "/people/": proj.get("people", 0) > 0,
-                    "/storyboard/": proj.get("spreads_json", False),
-                    "/editor/": proj.get("rendered_count", 0) > 0,
+                    "/storyboard/": proj.get("shortlisted", 0) > 0,
+                    "/people/": proj.get("spreads_json", False),
+                    "/editor/": proj.get("faces", 0) > 0,
                     "/export/": proj.get("rendered_count", 0) > 0,
                 }
-                body = json.dumps({"jobs": jobs, "ready": ready, "any_running": _any_running()}).encode("utf-8")
+                body = json.dumps({
+                    "jobs": jobs, "ready": ready, "any_running": _any_running(),
+                    "group_running": group_running, "group_keys": group_keys, "stats": proj,
+                }).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -463,21 +542,21 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
 
-            if path.startswith("/run/"):
-                key = path.rsplit("/", 1)[-1]
-                if key not in STAGE_BY_KEY:
-                    self.send_response(404)
-                    self.end_headers()
+            if path == "/run-group":
+                qs = urllib.parse.parse_qs(parsed.query)
+                keys = [k for k in qs.get("keys", [""])[0].split(",") if k]
+                if not keys or any(k not in STAGE_BY_KEY for k in keys):
+                    self._send_json(json.dumps({"error": "unknown stage key"}).encode("utf-8"), 400)
                     return
-                if key in SIZE_REQUIRED_STAGES and not state.get("size"):
+                if any(k in SIZE_REQUIRED_STAGES for k in keys) and not state.get("size"):
                     self._send_json(json.dumps({"error": "Choose a print size on Setup before running this stage."}).encode("utf-8"), 400)
                     return
                 if _any_running():
                     self._send_json(json.dumps({"error": "Another stage is already running -- pause it first."}).encode("utf-8"), 409)
                     return
                 threading.Thread(
-                    target=_run_stage_blocking,
-                    args=(key, db_path, exports_dir, state["source_dir"], state.get("size", ""),
+                    target=_run_group,
+                    args=(keys, db_path, exports_dir, state["source_dir"], state.get("size", ""),
                           state.get("orientation", "landscape")),
                     daemon=True,
                 ).start()
@@ -485,13 +564,21 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 return
 
             if path == "/pause":
+                with _group_lock:
+                    _group_state["pause_requested"] = True
                 _terminate_current()
                 self._accept()
                 return
 
             if path == "/stop-project":
+                with _group_lock:
+                    _group_state["stop_requested"] = True
                 _terminate_current()
                 _wipe_project(db_path, exports_dir)
+                with _group_lock:
+                    _group_state["running"] = False
+                    _group_state["keys"] = []
+                    _group_state["stop_requested"] = False
                 state["size"] = ""
                 state["orientation"] = "landscape"
                 _save_ui_state(exports_dir, state)
