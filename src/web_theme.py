@@ -192,8 +192,8 @@ def page_shell(active_prefix: str, title: str, subtitle: str, body_html: str,
     <div class="topbar">
       <div><div class="topbar-title"><h2>{html.escape(title)}</h2></div><div class="topbar-sub">{subtitle}</div></div>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-        <div class="status-pill" id="chainPill" style="display:none;"><span id="chainPillText"></span></div>
-        <button class="btn btn-primary" id="resumePipelineBtn" style="display:none;">Resume Pipeline</button>
+        <div class="status-pill" id="busyPill" style="display:none;"><span class="status-dot loading"></span><span id="busyPillText"></span></div>
+        <button class="btn btn-danger" id="globalStopBtn" style="display:none;">Stop &amp; Clear Project</button>
         <div class="status-pill" id="enginePill"><span class="status-dot" id="engineDot"></span><span id="engineText">AI engine: &hellip;</span></div>
       </div>
     </div>
@@ -218,54 +218,45 @@ pollEngine();
 
 function pollNavReady() {{
   fetch('/status').then(r => r.json()).then(data => {{
-    if (!data.ready) return;
-    document.querySelectorAll('[data-nav-href]').forEach(a => {{
-      const href = a.dataset.navHref;
-      const ready = href === '/' || data.ready[href] !== false;
-      a.classList.toggle('locked', !ready);
-      if (!ready && !a.dataset.lockWired) {{
-        a.dataset.lockWired = '1';
-        a.addEventListener('click', (e) => {{
-          if (a.classList.contains('locked')) {{
-            e.preventDefault();
-            alert('This screen isn\\'t ready yet -- run the pipeline further on the Dashboard first.');
-          }}
-        }});
-      }}
-    }});
+    if (data.ready) {{
+      document.querySelectorAll('[data-nav-href]').forEach(a => {{
+        const href = a.dataset.navHref;
+        const ready = href === '/' || data.ready[href] !== false;
+        a.classList.toggle('locked', !ready);
+        if (!ready && !a.dataset.lockWired) {{
+          a.dataset.lockWired = '1';
+          a.addEventListener('click', (e) => {{
+            if (a.classList.contains('locked')) {{
+              e.preventDefault();
+              alert('This screen isn\\'t ready yet -- run the earlier pipeline stages first.');
+            }}
+          }});
+        }}
+      }});
+    }}
 
-    // Lets the pipeline be resumed from any step screen, not just Setup, per user request
-    // (2026-09-01: "I shouldn't need to come back to the dashboard screen").
-    const chain = data.chain || {{}};
-    const pill = document.getElementById('chainPill');
-    const pillText = document.getElementById('chainPillText');
-    const resumeBtn = document.getElementById('resumePipelineBtn');
-    if (!pill || !resumeBtn) return;
-    if (chain.running) {{
+    // Any running pipeline stage is shown + stoppable from every screen, not just Setup,
+    // per user request (2026-09-02): each stage now has its own Start/Pause button on its
+    // own step screen, but Stop is always whole-project, so it stays global here.
+    const pill = document.getElementById('busyPill');
+    const pillText = document.getElementById('busyPillText');
+    const stopBtn = document.getElementById('globalStopBtn');
+    if (!pill || !stopBtn) return;
+    if (data.any_running) {{
       pill.style.display = 'inline-flex';
-      pillText.textContent = 'Pipeline running\\u2026';
-      resumeBtn.style.display = 'none';
-    }} else if (chain.checkpoint_key && chain.checkpoint_label) {{
-      pill.style.display = 'inline-flex';
-      pillText.textContent = chain.checkpoint_label;
-      resumeBtn.style.display = 'inline-flex';
-      resumeBtn.textContent = 'Resume Pipeline';
-    }} else if (chain.failed_key) {{
-      pill.style.display = 'inline-flex';
-      pillText.textContent = 'Stopped: ' + chain.failed_key + ' failed';
-      resumeBtn.style.display = 'none';
+      const runningKey = data.jobs ? Object.keys(data.jobs).find(k => data.jobs[k].running) : null;
+      pillText.textContent = runningKey ? ('Running: ' + runningKey) : 'A stage is running\\u2026';
+      stopBtn.style.display = 'inline-flex';
     }} else {{
       pill.style.display = 'none';
-      resumeBtn.style.display = 'none';
+      stopBtn.style.display = 'none';
     }}
-    if (!resumeBtn.dataset.wired) {{
-      resumeBtn.dataset.wired = '1';
-      resumeBtn.addEventListener('click', () => {{
-        resumeBtn.disabled = true;
-        resumeBtn.textContent = 'Starting\\u2026';
-        fetch('/chain/start', {{method: 'POST'}}).then(r => {{
-          if (!r.ok) return r.json().then(d => {{ alert(d.error || 'Could not resume.'); resumeBtn.disabled = false; }});
-        }}).catch(() => {{ resumeBtn.disabled = false; }});
+    if (!stopBtn.dataset.wired) {{
+      stopBtn.dataset.wired = '1';
+      stopBtn.addEventListener('click', () => {{
+        if (!confirm('This will permanently DELETE the project database and all exports (photos on disk are untouched). Continue?')) return;
+        stopBtn.disabled = true;
+        fetch('/stop-project', {{method: 'POST'}}).then(() => location.reload()).catch(() => {{ stopBtn.disabled = false; }});
       }});
     }}
   }}).catch(() => {{}});

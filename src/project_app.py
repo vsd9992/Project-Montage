@@ -1,26 +1,26 @@
 """Phase 3 (project-plan.md) third slice: project management -- run the Phase 1/2 batch
 pipeline (import -> burst -> quality -> Qwen -> shortlist -> spread -> face -> people-
 cluster -> crop -> render -> PDF export) from a browser UI instead of hand-typed CLI
-commands, and see at a glance how far a project has gotten.
+commands.
 
 Stdlib-only (http.server), same pattern as `label_people_app.py` /
 `reorder_spreads_app.py`. Each stage is a long-running batch script (`import_stage.py`
 imports thousands of photos, `qwen_stage.py` runs local LLM inference, etc.) -- these run
 as a subprocess in a background thread so the HTTP request that starts a stage returns
-immediately; the page polls `/status` to show a prominent "running" banner, per-stage
-badges, and live log output, rather than holding the browser connection open for a
-multi-minute (or longer) run.
+immediately; screens poll `/status` to show a badge + live log output per stage.
 
-Chain controls (added after user feedback, 2026-09-01): a single Start button runs every
-stage in order, auto-advancing on success. Pause terminates the currently running
-subprocess and halts auto-advance -- resuming later re-enters at the same stage, which is
-safe because every stage is already designed to be resumable/idempotent (skips
-already-processed rows/files). Stop terminates the current subprocess AND wipes the whole
-project (DB file + exports dir) back to empty, per explicit user decision (2026-09-01):
-"wipe the whole project" was chosen over partial/no clearing, specifically because trying
-to undo only "what this run added" can't be done precisely (e.g. import_stage adds photos
-incrementally with no per-run marker). This is destructive and irreversible -- the UI
-requires a JS confirmation before calling it.
+Per-stage controls (rebuilt 2026-09-02, user request): there is no more single "Dashboard"
+screen or auto-advancing pipeline chain -- each pipeline stage gets its own Start/Pause
+button, and stages are distributed across the step screens they actually belong to
+(`stage_group_html()`/`STAGE_GROUP_SCRIPT` below are the reusable widget every screen
+embeds for its own stages; see SETUP_STAGES/STORYBOARD_STAGES/PEOPLE_STAGES/EDITOR_STAGES).
+Only one stage subprocess can run at a time (`_current_proc`); Start is rejected with 409
+while another stage is running. Stop remains whole-project: it terminates whatever is
+running and wipes the DB + exports dir back to empty -- per explicit user decision
+(2026-09-01), because undoing only "what this run added" can't be done precisely (e.g.
+import_stage adds photos incrementally with no per-run marker). This is destructive and
+irreversible -- the UI requires a JS confirmation before calling it, and doubles as the
+"New Project" action when nothing is running.
 """
 
 import argparse
@@ -65,15 +65,15 @@ STAGE_BY_KEY = {s["key"]: s for s in STAGES}
 STAGE_KEYS = [s["key"] for s in STAGES]
 MAX_LOG_LINES = 300
 
-# Chain checkpoints (per user decision, 2026-09-01): the chain must not run straight
-# through to a finished album unattended -- it pauses after these stages so the user can
-# review/adjust in the corresponding screen before continuing. Export is never part of the
-# auto-chain at all; it's a separate manual action on the Export screen.
-CHECKPOINTS = {
-    "spread": {"route": "/storyboard/", "label": "Review the storyboard (spread order/grouping)"},
-    "person_cluster": {"route": "/people/", "label": "Review and label people"},
-    "render": {"route": "/editor/", "label": "Review rendered spreads, then export manually"},
-}
+# Which screen each stage's controls live on, per user request (2026-09-02): "move the
+# pipeline stages to the relevant step page" instead of one Dashboard listing all ten.
+# This mirrors the checkpoint boundaries the pipeline already had (spread -> review in
+# Storyboard; face/person_cluster -> review in People; crop/render -> review in Editor).
+SETUP_STAGES = ["import", "burst", "quality", "qwen", "shortlist"]
+STORYBOARD_STAGES = ["spread"]
+PEOPLE_STAGES = ["face", "person_cluster"]
+EDITOR_STAGES = ["crop", "render"]
+SIZE_REQUIRED_STAGES = {"crop", "render"}
 
 _jobs_lock = threading.Lock()
 _jobs: dict[str, dict] = {}  # key -> {"running", "returncode", "lines", "started_at", "interrupted"}
@@ -81,16 +81,10 @@ _jobs: dict[str, dict] = {}  # key -> {"running", "returncode", "lines", "starte
 _proc_lock = threading.Lock()
 _current_proc = {"proc": None, "key": None}
 
-_chain_lock = threading.Lock()
-_chain_state = {
-    "running": False,
-    "current_index": 0,       # next stage index to (re)run
-    "finished": False,
-    "failed_key": None,
-    "pause_requested": False,
-    "stop_requested": False,
-    "checkpoint_key": None,   # set when the chain auto-paused at a review checkpoint
-}
+
+def _any_running() -> bool:
+    with _proc_lock:
+        return _current_proc["proc"] is not None
 
 
 def _project_status(db_path: str, exports_dir: str) -> dict:
@@ -115,6 +109,36 @@ def _project_status(db_path: str, exports_dir: str) -> dict:
     status["rendered_count"] = len(list(rendered_dir.glob("*.jpg"))) if rendered_dir.exists() else 0
     status["album_pdf"] = (exports / "album.pdf").exists()
     return status
+
+
+# --- UI state persistence (2026-09-02 fix) --------------------------------------------
+# Size/orientation previously lived only in the in-memory `state` dict, reset to the CLI
+# default on every app restart. That caused two user-reported bugs: (1) export's preflight
+# comparing against a fresh-default geometry that didn't match spreads actually rendered at
+# a different size/orientation before a restart, and (2) no way to tell "this is a resumed
+# project" from "this is a fresh one". Persisting the last-chosen size/orientation next to
+# the project's own exports dir (and clearing it on wipe) fixes both: a resumed project
+# keeps rendering at the size it was rendered at, and a wiped/fresh project has nothing to
+# resume, so it defaults cleanly.
+def _ui_state_path(exports_dir: str) -> Path:
+    return Path(exports_dir) / "ui_state.json"
+
+
+def _load_ui_state(exports_dir: str) -> dict:
+    p = _ui_state_path(exports_dir)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_ui_state(exports_dir: str, state: dict) -> None:
+    p = _ui_state_path(exports_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"size": state.get("size", ""), "orientation": state.get("orientation", "landscape")}),
+                 encoding="utf-8")
 
 
 def _build_args(stage: dict, db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> list[str]:
@@ -202,107 +226,10 @@ def _wipe_project(db_path: str, exports_dir: str) -> None:
         _jobs.clear()
 
 
-def _run_chain(db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> None:
-    with _chain_lock:
-        _chain_state["running"] = True
-        _chain_state["finished"] = False
-        _chain_state["failed_key"] = None
-        _chain_state["checkpoint_key"] = None
-        start_index = _chain_state["current_index"]
-
-    idx = start_index
-    hit_checkpoint = False
-    while idx < len(STAGE_KEYS):
-        with _chain_lock:
-            if _chain_state["stop_requested"] or _chain_state["pause_requested"]:
-                break
-            _chain_state["current_index"] = idx
-        key = STAGE_KEYS[idx]
-        rc = _run_stage_blocking(key, db_path, exports_dir, source_dir, size, orientation)
-
-        with _chain_lock:
-            stop = _chain_state["stop_requested"]
-            pause = _chain_state["pause_requested"]
-        if stop or pause:
-            break
-        if rc != 0:
-            with _chain_lock:
-                _chain_state["failed_key"] = key
-            break
-        idx += 1
-        if key in CHECKPOINTS:
-            hit_checkpoint = True
-            with _chain_lock:
-                _chain_state["current_index"] = idx
-                _chain_state["checkpoint_key"] = key
-            break
-
-    with _chain_lock:
-        stop = _chain_state["stop_requested"]
-        pause = _chain_state["pause_requested"]
-        _chain_state["running"] = False
-        if not stop and not pause and not hit_checkpoint and _chain_state["failed_key"] is None:
-            _chain_state["current_index"] = len(STAGE_KEYS)
-            _chain_state["finished"] = True
-        _chain_state["pause_requested"] = False
-
-    if stop:
-        _wipe_project(db_path, exports_dir)
-        with _chain_lock:
-            _chain_state["current_index"] = 0
-            _chain_state["finished"] = False
-            _chain_state["failed_key"] = None
-            _chain_state["stop_requested"] = False
-
-
-def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> bytes:
-    status = _project_status(db_path, exports_dir)
-    with _chain_lock:
-        chain = dict(_chain_state)
-    rows = []
-    for i, stage in enumerate(STAGES):
-        with _jobs_lock:
-            job = _jobs.get(stage["key"])
-        running = job["running"] if job else False
-        rc = job["returncode"] if job else None
-        interrupted = job["interrupted"] if job else False
-        if running:
-            badge = "running"
-        elif interrupted:
-            badge = "paused"
-        elif rc == 0:
-            badge = "ok"
-        elif rc not in (None, 0):
-            badge = "failed"
-        else:
-            badge = "idle"
-        rows.append(f"""
-        <div class="stage" data-key="{stage['key']}">
-          <div class="stage-head">
-            <span class="badge {badge}" data-badge>{badge}</span>
-            <strong>{i + 1}. {html.escape(stage['label'])}</strong>
-            <a href="#" class="details-toggle" data-details-toggle style="font-size:11.5px;color:var(--text-faint);">Details</a>
-          </div>
-          <pre class="log" data-log></pre>
-        </div>""")
-    extra_head = """
-<style>
-#banner { padding:14px 18px; border-radius:12px; background:var(--royal-soft); border:1px solid var(--royal);
-          font-weight:600; display:none; align-items:center; gap:0.9em; color:var(--text); }
-#banner.show { display:flex; }
-.spinner { width:14px; height:14px; border:2px solid var(--royal); border-top-color:transparent;
-           border-radius:50%; animation:spin 0.8s linear infinite; }
-@keyframes spin { to { transform:rotate(360deg); } }
-.stat-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}
-.stat-tile{padding:16px 18px;}
-.stat-value{font-family:'Newsreader',Georgia,serif;font-size:24px;font-weight:600;}
-.stat-label{font-size:12px;color:var(--text-muted);margin-top:4px;}
-form.config{display:flex;flex-wrap:wrap;align-items:center;gap:10px;}
-form.config input[type=text]{flex:1;min-width:220px;}
-.chain-controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;}
+# --- Reusable per-screen stage-controls widget -----------------------------------------
+STAGE_GROUP_CSS = """
 .stage{border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:8px;background:var(--bg-elev);}
 .stage-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
-.stage-head code{color:var(--text-faint);font-size:11.5px;}
 .stage-head strong{flex:1;min-width:120px;font-size:13.5px;}
 .badge{font-size:11px;padding:3px 9px;border-radius:999px;text-transform:uppercase;font-weight:700;letter-spacing:.03em;}
 .badge.idle{background:var(--bg-elev-2);color:var(--text-faint);}
@@ -313,10 +240,107 @@ form.config input[type=text]{flex:1;min-width:220px;}
 .log{max-height:160px;overflow-y:auto;background:oklch(22% 0.01 255);color:oklch(88% 0.005 255);font-size:11.5px;
      padding:8px 10px;margin-top:8px;display:none;white-space:pre-wrap;border-radius:8px;}
 .log.show{display:block;}
+.btn-sm{padding:5px 11px;font-size:12px;}
+.stage-group-title{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--text-faint);margin-bottom:2px;}
+"""
+
+STAGE_GROUP_SCRIPT = """
+function pollStageGroup() {
+  fetch('/status').then(r => r.json()).then(data => {
+    const jobs = data.jobs || {};
+    document.querySelectorAll('.stage[data-key]').forEach(el => {
+      const key = el.dataset.key;
+      const job = jobs[key];
+      const badgeEl = el.querySelector('[data-badge]');
+      const logEl = el.querySelector('[data-log]');
+      const startBtn = el.querySelector('[data-start]');
+      const pauseBtn = el.querySelector('[data-pause]');
+      let badge = 'idle', running = false;
+      if (job) {
+        running = !!job.running;
+        if (job.running) badge = 'running';
+        else if (job.interrupted) badge = 'paused';
+        else if (job.returncode === 0) badge = 'ok';
+        else if (job.returncode !== null) badge = 'failed';
+        if (job.lines && job.lines.length) {
+          logEl.textContent = job.lines.join('\\n');
+          if (el.dataset.detailsOpen === '1') { logEl.classList.add('show'); logEl.scrollTop = logEl.scrollHeight; }
+        }
+      }
+      badgeEl.textContent = badge;
+      badgeEl.className = 'badge ' + badge;
+      if (startBtn) {
+        startBtn.style.display = running ? 'none' : 'inline-block';
+        startBtn.disabled = !running && data.any_running;
+      }
+      if (pauseBtn) pauseBtn.style.display = running ? 'inline-block' : 'none';
+    });
+  });
+}
+document.addEventListener('click', (e) => {
+  const details = e.target.closest('[data-details-toggle]');
+  if (details) {
+    e.preventDefault();
+    const stageEl = details.closest('.stage');
+    const open = stageEl.dataset.detailsOpen === '1';
+    stageEl.dataset.detailsOpen = open ? '0' : '1';
+    stageEl.querySelector('[data-log]').classList.toggle('show', !open);
+    details.textContent = open ? 'Details' : 'Hide details';
+    return;
+  }
+  const startBtn = e.target.closest('[data-start]');
+  if (startBtn) {
+    const key = startBtn.closest('.stage').dataset.key;
+    startBtn.disabled = true;
+    fetch('/run/' + key, {method: 'POST'}).then(r => {
+      if (!r.ok) return r.json().then(d => alert(d.error || 'Could not start this stage.')).catch(() => alert('Could not start this stage (another stage may already be running).'));
+    }).catch(() => {}).finally(() => { startBtn.disabled = false; });
+    return;
+  }
+  const pauseBtn = e.target.closest('[data-pause]');
+  if (pauseBtn) {
+    pauseBtn.disabled = true;
+    fetch('/pause', {method: 'POST'}).finally(() => { pauseBtn.disabled = false; });
+    return;
+  }
+});
+setInterval(pollStageGroup, 1500);
+pollStageGroup();
+"""
+
+
+def stage_group_html(keys: list[str], title: str = "Pipeline stages") -> str:
+    rows = []
+    for key in keys:
+        stage = STAGE_BY_KEY[key]
+        rows.append(f"""
+        <div class="stage" data-key="{stage['key']}">
+          <div class="stage-head">
+            <span class="badge idle" data-badge>idle</span>
+            <strong>{html.escape(stage['label'])}</strong>
+            <button type="button" class="btn btn-outline btn-sm" data-start>Start</button>
+            <button type="button" class="btn btn-outline btn-sm" data-pause style="display:none;">Pause</button>
+            <a href="#" class="details-toggle" data-details-toggle style="font-size:11.5px;color:var(--text-faint);">Details</a>
+          </div>
+          <pre class="log" data-log></pre>
+        </div>""")
+    return f'<div><div class="stage-group-title">{html.escape(title)}</div>{"".join(rows)}</div>'
+
+
+def _render_index(db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> bytes:
+    status = _project_status(db_path, exports_dir)
+    any_running = _any_running()
+    extra_head = f"""
+<style>
+.stat-row{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;}}
+.stat-tile{{padding:16px 18px;}}
+.stat-value{{font-family:'Newsreader',Georgia,serif;font-size:24px;font-weight:600;}}
+.stat-label{{font-size:12px;color:var(--text-muted);margin-top:4px;}}
+form.config{{display:flex;flex-wrap:wrap;align-items:center;gap:10px;}}
+form.config input[type=text]{{flex:1;min-width:220px;}}
+{STAGE_GROUP_CSS}
 </style>"""
     body = f"""
-<div id="banner"><span class="spinner"></span><span id="bannerText">Working...</span></div>
-
 <div class="stat-row">
 <div class="card stat-tile"><div class="stat-value">{status.get('photos', 0)}</div><div class="stat-label">Photos imported</div></div>
 <div class="card stat-tile"><div class="stat-value">{'&#10003;' if status.get('spreads_json') else '&mdash;'}</div><div class="stat-label">Spreads planned</div></div>
@@ -348,107 +372,17 @@ form.config input[type=text]{flex:1;min-width:220px;}
   </div>
 </form>
 
-<div class="chain-controls">
-  <button id="startBtn" class="btn btn-primary" {'disabled' if not size else ''}>Start / Resume Pipeline</button>
-  <button id="pauseBtn" class="btn btn-outline">Pause</button>
-  <button id="stopBtn" class="btn btn-danger">Stop &amp; Clear Project</button>
-  <span id="chainText" style="font-size:12.5px;color:var(--text-muted);"></span>
+<div class="card" style="padding:14px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+  <button id="newProjectBtn" class="btn btn-danger">{'Stop &amp; Clear Project' if any_running else 'New Project (Clear)'}</button>
+  <span style="font-size:11.5px;color:var(--text-faint);">Permanently deletes the project database and all exports so far
+  (photos on disk in your source folder are never touched).</span>
 </div>
-<div id="checkpointBanner" style="display:none;padding:12px 16px;border-radius:10px;background:var(--brown-soft);border:1px solid var(--brown);font-size:12.5px;font-weight:600;margin-top:4px;"></div>
 
-<div>
-<div class="section-title" style="margin-bottom:10px;">Pipeline stages</div>
-{''.join(rows)}
-</div>
+{stage_group_html(SETUP_STAGES, "Setup stages")}
 """
     extra_script = ("""
-function poll() {
-  fetch('/status').then(r => r.json()).then(data => {
-    const jobs = data.jobs, chain = data.chain;
-    for (const key in jobs) {
-      const el = document.querySelector('.stage[data-key="' + key + '"]');
-      if (!el) continue;
-      const badgeEl = el.querySelector('[data-badge]');
-      const logEl = el.querySelector('[data-log]');
-      const job = jobs[key];
-      let badge = 'idle';
-      if (job.running) badge = 'running';
-      else if (job.interrupted) badge = 'paused';
-      else if (job.returncode === 0) badge = 'ok';
-      else if (job.returncode !== null) badge = 'failed';
-      badgeEl.textContent = badge;
-      badgeEl.className = 'badge ' + badge;
-      if (job.lines && job.lines.length) {
-        logEl.textContent = job.lines.join('\\n');
-        if (el.dataset.detailsOpen === '1') {
-          logEl.classList.add('show');
-          logEl.scrollTop = logEl.scrollHeight;
-        }
-      }
-    }
-
-    const banner = document.getElementById('banner');
-    const bannerText = document.getElementById('bannerText');
-    const anyRunning = Object.values(jobs).some(j => j.running);
-    if (chain.running) {
-      const stageKey = Object.keys(jobs).find(k => jobs[k].running);
-      const label = stageKey ? stageKey : ('stage ' + (chain.current_index + 1));
-      bannerText.textContent = 'Pipeline running -- ' + label + ' (' + (chain.current_index + 1) + '/""" + str(len(STAGES)) + """)...';
-      banner.classList.add('show');
-    } else if (anyRunning) {
-      const stageKey = Object.keys(jobs).find(k => jobs[k].running);
-      bannerText.textContent = 'Running: ' + stageKey + '...';
-      banner.classList.add('show');
-    } else {
-      banner.classList.remove('show');
-    }
-
-    const chainText = document.getElementById('chainText');
-    if (chain.finished) chainText.textContent = 'All stages complete.';
-    else if (chain.failed_key) chainText.textContent = 'Stopped: ' + chain.failed_key + ' failed.';
-    else if (chain.running) chainText.textContent = 'Running...';
-    else if (chain.current_index > 0) chainText.textContent = 'Paused at stage ' + (chain.current_index + 1) + '.';
-    else chainText.textContent = '';
-
-    const checkpointBanner = document.getElementById('checkpointBanner');
-    if (!chain.running && chain.checkpoint_key && chain.checkpoint_route) {
-      checkpointBanner.innerHTML = chain.checkpoint_label + ' &mdash; <a href="' + chain.checkpoint_route + '">open that screen</a>, then come back and click Start to continue.';
-      checkpointBanner.style.display = 'block';
-    } else {
-      checkpointBanner.style.display = 'none';
-    }
-
-    const sizeChosen = !!document.getElementById('sizeSelect').value;
-    document.getElementById('startBtn').disabled = chain.running || !sizeChosen;
-    document.getElementById('pauseBtn').disabled = !chain.running;
-  });
-}
-document.querySelectorAll('[data-details-toggle]').forEach(link => {
-  link.addEventListener('click', (e) => {
-    e.preventDefault();
-    const stageEl = link.closest('.stage');
-    const open = stageEl.dataset.detailsOpen === '1';
-    stageEl.dataset.detailsOpen = open ? '0' : '1';
-    stageEl.querySelector('[data-log]').classList.toggle('show', !open);
-    link.textContent = open ? 'Details' : 'Hide details';
-  });
-});
-document.getElementById('startBtn').addEventListener('click', () => {
-  const size = document.getElementById('sizeSelect').value;
-  const orientation = document.getElementById('orientationSelect').value;
-  fetch('/chain/start?size=' + encodeURIComponent(size) + '&orientation=' + encodeURIComponent(orientation), {method: 'POST'}).then(r => {
-    if (!r.ok) r.json().then(d => alert(d.error || 'Could not start the pipeline.')).catch(() => {});
-  });
-});
-document.getElementById('orientationSelect').addEventListener('change', (e) => {
-  fetch('/set-orientation?orientation=' + encodeURIComponent(e.target.value), {method: 'POST'});
-});
-document.getElementById('pauseBtn').addEventListener('click', () => {
-  fetch('/chain/pause', {method: 'POST'});
-});
-document.getElementById('stopBtn').addEventListener('click', () => {
-  if (!confirm('Stop will permanently DELETE the project database and all exports (photos on disk are untouched). Continue?')) return;
-  fetch('/chain/stop', {method: 'POST'}).then(() => location.reload());
+document.getElementById('sourceInput').addEventListener('change', () => {
+  fetch('/set-source-dir?source_dir=' + encodeURIComponent(document.getElementById('sourceInput').value), {method: 'POST'});
 });
 document.getElementById('chooseFolderBtn').addEventListener('click', () => {
   const btn = document.getElementById('chooseFolderBtn');
@@ -460,18 +394,19 @@ document.getElementById('chooseFolderBtn').addEventListener('click', () => {
     if (data.path) document.getElementById('sourceInput').value = data.path;
   }).catch(() => { btn.disabled = false; btn.textContent = 'Choose Folder\\u2026'; });
 });
-document.getElementById('sourceInput').addEventListener('change', () => {
-  fetch('/set-source-dir?source_dir=' + encodeURIComponent(document.getElementById('sourceInput').value), {method: 'POST'});
-});
 document.getElementById('sizeSelect').addEventListener('change', (e) => {
-  fetch('/set-size?size=' + encodeURIComponent(e.target.value), {method: 'POST'}).then(() => {
-    document.getElementById('startBtn').disabled = !e.target.value;
-  });
+  fetch('/set-size?size=' + encodeURIComponent(e.target.value), {method: 'POST'});
 });
-setInterval(poll, 1500);
-poll();
-""")
-    return web_theme.page_shell("/", "Dashboard", "Pipeline status and controls", body, extra_head, extra_script)
+document.getElementById('orientationSelect').addEventListener('change', (e) => {
+  fetch('/set-orientation?orientation=' + encodeURIComponent(e.target.value), {method: 'POST'});
+});
+document.getElementById('newProjectBtn').addEventListener('click', () => {
+  if (!confirm('This will permanently DELETE the project database and all exports (photos on disk are untouched). Continue?')) return;
+  fetch('/stop-project', {method: 'POST'}).then(() => location.reload());
+});
+""" + STAGE_GROUP_SCRIPT)
+    return web_theme.page_shell("/", "Setup", "Choose photos & print size, then run the early pipeline stages",
+                                 body, extra_head, extra_script)
 
 
 def make_handler(db_path: str, exports_dir: str, state: dict):
@@ -495,12 +430,6 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
             elif parsed.path == "/status":
                 with _jobs_lock:
                     jobs = dict(_jobs)
-                with _chain_lock:
-                    chain = dict(_chain_state)
-                cp = CHECKPOINTS.get(chain.get("checkpoint_key"))
-                if cp:
-                    chain["checkpoint_route"] = cp["route"]
-                    chain["checkpoint_label"] = cp["label"]
                 proj = _project_status(db_path, exports_dir)
                 ready = {
                     "/people/": proj.get("people", 0) > 0,
@@ -508,7 +437,7 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                     "/editor/": proj.get("rendered_count", 0) > 0,
                     "/export/": proj.get("rendered_count", 0) > 0,
                 }
-                body = json.dumps({"jobs": jobs, "chain": chain, "ready": ready}).encode("utf-8")
+                body = json.dumps({"jobs": jobs, "ready": ready, "any_running": _any_running()}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -540,11 +469,11 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                     self.send_response(404)
                     self.end_headers()
                     return
-                with _jobs_lock:
-                    already_running = _jobs.get(key, {}).get("running", False)
-                if already_running:
-                    self.send_response(409)
-                    self.end_headers()
+                if key in SIZE_REQUIRED_STAGES and not state.get("size"):
+                    self._send_json(json.dumps({"error": "Choose a print size on Setup before running this stage."}).encode("utf-8"), 400)
+                    return
+                if _any_running():
+                    self._send_json(json.dumps({"error": "Another stage is already running -- pause it first."}).encode("utf-8"), 409)
                     return
                 threading.Thread(
                     target=_run_stage_blocking,
@@ -552,6 +481,20 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                           state.get("orientation", "landscape")),
                     daemon=True,
                 ).start()
+                self._accept()
+                return
+
+            if path == "/pause":
+                _terminate_current()
+                self._accept()
+                return
+
+            if path == "/stop-project":
+                _terminate_current()
+                _wipe_project(db_path, exports_dir)
+                state["size"] = ""
+                state["orientation"] = "landscape"
+                _save_ui_state(exports_dir, state)
                 self._accept()
                 return
 
@@ -567,6 +510,7 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 if value and value not in PRINT_SIZES:
                     self.send_response(400); self.end_headers(); return
                 state["size"] = value
+                _save_ui_state(exports_dir, state)
                 self._accept()
                 return
 
@@ -576,6 +520,7 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 if value not in ORIENTATIONS:
                     self.send_response(400); self.end_headers(); return
                 state["orientation"] = value
+                _save_ui_state(exports_dir, state)
                 self._accept()
                 return
 
@@ -601,73 +546,6 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 self._send_json(body)
                 return
 
-            if path == "/chain/start":
-                # Size travels with this same request (query param), per user-reported bug
-                # (2026-09-01): a separate prior /set-size fetch and this one could race
-                # (no ordering guarantee between two independent browser fetches), letting
-                # the chain start with a stale size. Falls back to state["size"] if the
-                # query param is absent (e.g. a bare curl/API call).
-                qs = urllib.parse.parse_qs(parsed.query)
-                if "size" in qs:
-                    requested_size = qs["size"][0]
-                    if requested_size and requested_size not in PRINT_SIZES:
-                        self._send_json(b'{"error": "unknown print size"}', 400)
-                        return
-                    state["size"] = requested_size
-                if "orientation" in qs:
-                    requested_orientation = qs["orientation"][0]
-                    if requested_orientation not in ORIENTATIONS:
-                        self._send_json(b'{"error": "unknown orientation"}', 400)
-                        return
-                    state["orientation"] = requested_orientation
-                if not state.get("size"):
-                    self._send_json(b'{"error": "print size not chosen"}', 400)
-                    return
-                with _chain_lock:
-                    if _chain_state["running"]:
-                        self.send_response(409)
-                        self.end_headers()
-                        return
-                    _chain_state["stop_requested"] = False
-                    _chain_state["pause_requested"] = False
-                    _chain_state["checkpoint_key"] = None
-                    if _chain_state["finished"]:
-                        _chain_state["current_index"] = 0
-                        _chain_state["finished"] = False
-                threading.Thread(
-                    target=_run_chain,
-                    args=(db_path, exports_dir, state["source_dir"], state["size"],
-                          state.get("orientation", "landscape")),
-                    daemon=True,
-                ).start()
-                self._accept()
-                return
-
-            if path == "/chain/pause":
-                with _chain_lock:
-                    _chain_state["pause_requested"] = True
-                _terminate_current()
-                self._accept()
-                return
-
-            if path == "/chain/stop":
-                with _chain_lock:
-                    _chain_state["stop_requested"] = True
-                _terminate_current()
-                # if no chain was running, wipe happens inline here; if a chain thread is
-                # running it observes stop_requested and wipes itself after unwinding.
-                with _chain_lock:
-                    chain_running = _chain_state["running"]
-                if not chain_running:
-                    _wipe_project(db_path, exports_dir)
-                    with _chain_lock:
-                        _chain_state["current_index"] = 0
-                        _chain_state["finished"] = False
-                        _chain_state["failed_key"] = None
-                        _chain_state["stop_requested"] = False
-                self._accept()
-                return
-
             self.send_response(404)
             self.end_headers()
 
@@ -676,6 +554,7 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
 
 def run(db_path: str, exports_dir: str, source_dir: str, port: int) -> None:
     state = {"source_dir": source_dir, "size": "", "orientation": "landscape"}
+    state.update(_load_ui_state(exports_dir))
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(db_path, exports_dir, state))
     print(f"Serving project pipeline UI at http://127.0.0.1:{port}/  (db: {db_path})")
     try:

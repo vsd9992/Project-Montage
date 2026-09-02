@@ -76,8 +76,8 @@ form.config input[type=text]{flex:1;min-width:220px;}
   <div class="kv"><div class="k">Print size</div><div>{html.escape(size)} ({html.escape(orientation)})</div></div>
   <div class="kv"><div class="k">Design style</div><div>{html.escape(style)}</div></div>
   <div class="kv"><div class="k">Rendered dir</div><div>{html.escape(rendered_dir)}</div></div>
-  <p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">To change size or style, re-render
-  from the Dashboard pipeline or Spread Editor's "regenerate all", then reopen this screen.</p>
+  <p style="font-size:11.5px;color:var(--text-faint);margin-top:8px;">To change size or style, change it on
+  Setup, then re-render from the Spread Editor screen ("regenerate all"), then reopen this screen.</p>
 </div>
 
 <div class="card" style="padding:18px 20px;">
@@ -190,7 +190,17 @@ def make_handler(rendered_dir: str, spreads_path: str, db_path: str, exports_dir
                     results = run_preflight(rendered_dir, spreads_path, current_size, current_orientation)
                     failed = [r for r in results if not r.get("ok")]
                     if failed:
-                        raise RuntimeError(f"{len(failed)} spread(s) failed preflight")
+                        # Most common cause: the rendered spreads were produced at a
+                        # different size/orientation than the one currently selected (e.g.
+                        # the size was changed after rendering, without re-rendering).
+                        # Surface the first concrete issue plus a pointer to the fix rather
+                        # than a bare count, per user report (2026-09-02) of an opaque
+                        # "preflight failed" message.
+                        sample = "; ".join(failed[0].get("issues", [])) or "unknown issue"
+                        raise RuntimeError(
+                            f"{len(failed)} spread(s) failed preflight ({sample}). "
+                            "Re-run Render on the Spread Editor screen at the current print size/orientation, then export again."
+                        )
                     export_pdf(rendered_dir, spreads_path, out_pdf, skip_failed=False,
                                size=current_size, orientation=current_orientation)
                     # Export succeeded and the PDF is safely outside exports_dir now -- clear

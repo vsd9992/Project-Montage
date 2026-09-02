@@ -28,6 +28,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+import project_app
 import web_theme
 from conversation_stage import candidate_pool, propose_edits
 from crop_stage import compute_crop
@@ -124,24 +125,27 @@ def _not_ready_page(mount: str, what: str) -> bytes:
     body = f"""
 <div class="card" style="padding:22px 26px;">
   <p style="font-weight:600;">Not ready yet.</p>
-  <p style="color:var(--text-faint);font-size:12.5px;">{html.escape(what)} -- run the pipeline
-  further on the Dashboard first.</p>
-  <a class="btn btn-outline" href="/">&larr; Back to Dashboard</a>
-</div>"""
-    return web_theme.page_shell("/editor/", "Spread Editor", "Not ready yet", body)
+  <p style="color:var(--text-faint);font-size:12.5px;">{html.escape(what)} -- start the stages
+  below (people should already be reviewed on the People screen).</p>
+</div>
+{project_app.stage_group_html(project_app.EDITOR_STAGES, "Spread Editor stages")}"""
+    return web_theme.page_shell("/editor/", "Spread Editor", "Not ready yet",
+                                 body, f"<style>{project_app.STAGE_GROUP_CSS}</style>", project_app.STAGE_GROUP_SCRIPT)
 
 
 def _render_grid(spreads_path: str, mount: str) -> bytes:
     spreads = _load_json(spreads_path)
-    extra_head = """
+    extra_head = f"""
 <style>
-.grid { display: flex; flex-wrap: wrap; gap: 1em; }
-.spread { width: 200px; padding: 0.6em; text-decoration: none; color: inherit; display: block; }
-.spread img { width: 100%; height: 130px; object-fit: cover; border-radius: 6px; }
-.meta { font-size: 0.85em; margin-top: 0.5em; color: var(--text-muted); }
-#bulkStatus { margin-left: 1em; color: var(--emerald-strong); font-weight: 600; }
+.grid {{ display: flex; flex-wrap: wrap; gap: 1em; }}
+.spread {{ width: 200px; padding: 0.6em; text-decoration: none; color: inherit; display: block; }}
+.spread img {{ width: 100%; height: 130px; object-fit: cover; border-radius: 6px; }}
+.meta {{ font-size: 0.85em; margin-top: 0.5em; color: var(--text-muted); }}
+#bulkStatus {{ margin-left: 1em; color: var(--emerald-strong); font-weight: 600; }}
+{project_app.STAGE_GROUP_CSS}
 </style>"""
     body = f"""
+{project_app.stage_group_html(project_app.EDITOR_STAGES, "Spread Editor stages")}
 <p><button id="bulkBtn" class="btn btn-outline">Regenerate all unlocked spreads</button><span id="bulkStatus"></span></p>
 <div class="grid">
 {_grid_html(spreads, mount)}
@@ -157,7 +161,7 @@ document.getElementById('bulkBtn').addEventListener('click', () => {
     btn.disabled = false;
   });
 });
-""")
+""" + project_app.STAGE_GROUP_SCRIPT)
     return web_theme.page_shell(
         "/editor/", "Spread Editor", f"{len(spreads)} spreads", body, extra_head, extra_script,
     )
@@ -216,7 +220,7 @@ a.back { display: inline-block; margin-bottom: 1em; font-size: 12.5px; color: va
 {'<p class="locked-note">Locked -- unlock to edit or regenerate.</p>' if locked else ''}
 {f'<img class="rendered" src="{mount}/rendered/{spread_number}?t={hash(json.dumps(spread))}">' if has_render else
  '<div class="card" style="padding:16px 20px;color:var(--text-faint);font-size:12.5px;">'
- 'Not rendered yet -- click "Regenerate this spread" below, or run the Render stage on the Dashboard.</div>'}
+ 'Not rendered yet -- click "Regenerate this spread" below, or run the Render stage above.</div>'}
 <div class="controls">
   <form method="post" action="{mount}/spread/{spread_number}/lock" style="display:inline">
     <button type="submit" class="btn btn-outline">{lock_label}</button>

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+import project_app
 import web_theme
 from db import connect
 from reorder_spreads import apply_reorder
@@ -48,14 +49,15 @@ def _rep_filename(spread: dict) -> str | None:
 
 
 def _not_ready_page(mount: str) -> bytes:
-    body = """
+    body = f"""
 <div class="card" style="padding:22px 26px;">
   <p style="font-weight:600;">Not ready yet.</p>
   <p style="color:var(--text-faint);font-size:12.5px;">The storyboard (spread layout plan) hasn't been
-  generated yet -- run the pipeline further on the Dashboard first.</p>
-  <a class="btn btn-outline" href="/">&larr; Back to Dashboard</a>
-</div>"""
-    return web_theme.page_shell("/storyboard/", "Storyboard", "Not ready yet", body)
+  generated yet -- start the stage below (photos must already be imported and shortlisted on Setup).</p>
+</div>
+{project_app.stage_group_html(project_app.STORYBOARD_STAGES, "Storyboard stage")}"""
+    return web_theme.page_shell("/storyboard/", "Storyboard", "Not ready yet",
+                                 body, f"<style>{project_app.STAGE_GROUP_CSS}</style>", project_app.STAGE_GROUP_SCRIPT)
 
 
 def _render_index(spreads_path: str, mount: str) -> bytes:
@@ -70,17 +72,19 @@ def _render_index(spreads_path: str, mount: str) -> bytes:
           <img src="{mount}/spread_thumb/{s['spread']}" loading="lazy">
           <div class="meta">#{s['spread']} &mdash; {event}<br>{layout}, {n_photos} photo(s)</div>
         </div>""")
-    extra_head = """
+    extra_head = f"""
 <style>
-.grid { display: flex; flex-wrap: wrap; gap: 1em; }
-.spread { width: 200px; padding: 0.6em; cursor: grab; }
-.spread img { width: 100%; height: 130px; object-fit: cover; border-radius: 6px; }
-.spread.dragging { opacity: 0.4; }
-.spread.drag-over { border-color: var(--emerald); border-width: 2px; }
-.meta { font-size: 0.85em; margin-top: 0.5em; color: var(--text-muted); }
-#status { margin-bottom: 1em; color: var(--emerald-strong); font-weight: 600; min-height: 1.2em; }
+.grid {{ display: flex; flex-wrap: wrap; gap: 1em; }}
+.spread {{ width: 200px; padding: 0.6em; cursor: grab; }}
+.spread img {{ width: 100%; height: 130px; object-fit: cover; border-radius: 6px; }}
+.spread.dragging {{ opacity: 0.4; }}
+.spread.drag-over {{ border-color: var(--emerald); border-width: 2px; }}
+.meta {{ font-size: 0.85em; margin-top: 0.5em; color: var(--text-muted); }}
+#status {{ margin-bottom: 1em; color: var(--emerald-strong); font-weight: 600; min-height: 1.2em; }}
+{project_app.STAGE_GROUP_CSS}
 </style>"""
     body = f"""
+{project_app.stage_group_html(project_app.STORYBOARD_STAGES, "Storyboard stage")}
 <p style="font-size:12.5px;color:var(--text-muted);">Drag a card to a new position. Order saves
 automatically on drop (re-render afterwards to produce the reordered album pages).</p>
 <div id="status"></div>
@@ -131,7 +135,7 @@ function saveOrder() {
     else { status.textContent = 'Save failed (' + r.status + ')'; }
   }).catch(() => { status.textContent = 'Save failed (network error)'; });
 }
-""")
+""" + project_app.STAGE_GROUP_SCRIPT)
     return web_theme.page_shell(
         "/storyboard/", "Storyboard", f"{len(spreads)} spreads &mdash; drag to reorder", body, extra_head, extra_script,
     )

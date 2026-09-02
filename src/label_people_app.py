@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageOps
 
+import project_app
 import web_theme
 from db import connect
 
@@ -79,16 +80,18 @@ def _render_index(conn: sqlite3.Connection, mount: str) -> bytes:
     ignored = _people_rows(conn, ignored=True)
     active_html = "".join(_person_card(p, False, mount) for p in active)
     ignored_html = "".join(_person_card(p, True, mount) for p in ignored)
-    extra_head = """
+    extra_head = f"""
 <style>
-.person-card{padding:14px;display:flex;flex-direction:column;gap:6px;}
-.person-head{display:flex;align-items:center;gap:12px;}
-.avatar{border-radius:50%;object-fit:cover;border:1px solid var(--border);}
-.person-count{font-size:11.5px;color:var(--text-faint);}
-details{margin-top:8px;}
-details summary{cursor:pointer;font-weight:600;color:var(--text-muted);}
+.person-card{{padding:14px;display:flex;flex-direction:column;gap:6px;}}
+.person-head{{display:flex;align-items:center;gap:12px;}}
+.avatar{{border-radius:50%;object-fit:cover;border:1px solid var(--border);}}
+.person-count{{font-size:11.5px;color:var(--text-faint);}}
+details{{margin-top:8px;}}
+details summary{{cursor:pointer;font-weight:600;color:var(--text-muted);}}
+{project_app.STAGE_GROUP_CSS}
 </style>"""
     body = f"""
+{project_app.stage_group_html(project_app.PEOPLE_STAGES, "People stages")}
 <p style="font-size:12.5px;color:var(--text-muted);">Type the same name on two different clusters to merge
 them. "Remove" moves a cluster to the list below instead of deleting it &mdash; restore any time.</p>
 <div class="grid-fill">
@@ -100,7 +103,8 @@ them. "Remove" moves a cluster to the list below instead of deleting it &mdash; 
 </div>
 </details>"""
     return web_theme.page_shell(
-        "/people/", "People", f"{len(active)} active clusters, {len(ignored)} removed", body, extra_head,
+        "/people/", "People", f"{len(active)} active clusters, {len(ignored)} removed",
+        body, extra_head, project_app.STAGE_GROUP_SCRIPT,
     )
 
 

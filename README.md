@@ -112,28 +112,38 @@ the right section. This replaced four/five separate processes on separate ports
 (`run_album_studio.bat`). All five screens share one design system (`src/web_theme.py`): a
 light theme, a horizontal step bar (not a persistent sidebar) that presents the app as a
 guided wizard — Setup → Storyboard → People → Spread Editor → Export — with steps locked
-until their data actually exists, a Back/Continue footer, a "Resume Pipeline" control
-available from any screen so you never have to return to Setup mid-project, and a live
-AI-engine status indicator. Laid out fluidly so it works at any browser window width.
+until their data actually exists, a Back/Continue footer, and a live AI-engine status
+indicator. Laid out fluidly so it works at any browser window width.
 
-The pipeline chain doesn't run straight through to a finished PDF: it auto-pauses for
-review after storyboard planning, after people clustering, and after rendering, and export
-is always a separate manual action from the Export screen — never part of the auto-chain.
-
-The **processing pipeline** itself is a sequence of independent, resumable, idempotent
-stages (each re-run skips already-processed rows/files), driven by the Dashboard screen
-or runnable standalone from the CLI:
+There is no separate "Dashboard" screen and no single pipeline-wide Start button. Each
+processing stage lives on the step screen it belongs to and has its own Start/Pause
+button, so you work through the app screen by screen rather than watching one long list:
 
 ```
-import → burst/duplicate detection → quality scoring → Qwen3-VL understanding
-  → shortlist → spread layout planning → face detection → people clustering
-  → intelligent cropping → render spreads → export PDF
+Setup:          import → burst/duplicate detection → quality scoring
+                → Qwen3-VL understanding → shortlist
+Storyboard:     spread layout planning
+People:         face detection → people clustering
+Spread Editor:  intelligent cropping → render spreads
+Export:         preflight check → save-as PDF export (always manual, never a "stage")
 ```
+
+Only one stage subprocess can run at a time across the whole app; starting a stage while
+another is running is rejected. A global "Stop & Clear Project" control (also labeled "New
+Project" when nothing is running) is available from every screen's top bar — it terminates
+whatever's running and wipes the project's database and exports back to empty, so you can
+always get back to a clean slate without leaving whatever screen you're on. This is
+destructive and irreversible (confirmed via a JS prompt) — your source photo folder is
+never touched.
 
 Every stage reads/writes a single local SQLite database (`cache/project_full.db`) plus a
 couple of JSON files (`exports/spreads.json`, `exports/crops.json`) that describe the
 current storyboard and crop choices — nothing is baked into rendered pixels until the
-render step, so re-ordering, re-styling, or re-cropping never means starting over.
+render step, so re-ordering, re-styling, or re-cropping never means starting over. The
+print size/orientation chosen on Setup is persisted to `exports/ui_state.json` so it
+survives an app restart and keeps matching whatever was actually rendered — if it ever
+doesn't (e.g. rendered spreads from an interrupted earlier size), Export's preflight check
+reports which spreads are stale and tells you to re-render before it will let you export.
 
 ## Components / tech stack
 
@@ -188,8 +198,8 @@ built and tested against, as a reasonable quality/size tradeoff.
 
 ### 3. Run the pipeline on your photos
 
-Launch the app and use the Dashboard's Start button (it runs every stage in order,
-auto-advancing, resumable if paused):
+Launch the app, then work through the step screens, starting each stage from its own
+Start button:
 
 ```bash
 run_album_studio.bat
@@ -205,30 +215,33 @@ or from any shell:
 
 This opens `http://127.0.0.1:8000/` in your browser at the Setup screen. Use "Choose
 Folder…" to pick your event's photo folder (opens a native OS dialog), choose a print size
-and orientation from the dropdowns, then hit Start. No AI model loads until a stage that
-needs one actually runs (Qwen3-VL for scene understanding) or you open the
-conversational-editing chat.
+and orientation from the dropdowns, then start the Setup-stage buttons in order (Import →
+Burst → Quality → Qwen3-VL → Shortlist). No AI model loads until the Qwen3-VL stage
+actually runs, or you open the conversational-editing chat.
 
 Each stage is also runnable standalone from the CLI (`python src/import_stage.py --help`,
-etc.) if you want to script the pipeline instead of using the Dashboard.
+etc.) if you want to script the pipeline instead of using the web UI.
 
 ### 4. Review, edit, export
 
-The Dashboard's Start button runs the pipeline as far as the next checkpoint, then pauses
-and points you at the right screen; a "Resume Pipeline" control on every screen lets you
-continue without going back to Setup.
+Move to the next step screen once its stage(s) are ready, starting each one from its own
+Start button (a screen is greyed out in the step bar until its data exists):
 
-- **Storyboard** — drag spreads into a different order (pipeline pauses here first, right
-  after spreads are planned).
-- **People** — name or merge face clusters (pipeline pauses here next, after clustering).
-- **Spread Editor** — swap a slot's photo via a photo-picker (click a same-event
-  candidate's thumbnail, no typing filenames), lock a spread, regenerate one or all
-  unlocked spreads, or type a plain-English instruction in the chat panel (pipeline pauses
-  here last, after rendering).
+- **Storyboard** — start "Spread layout planning", then drag spreads into a different
+  order once it finishes.
+- **People** — start "Face detection" then "People clustering", then name or merge the
+  resulting face clusters.
+- **Spread Editor** — start "Intelligent cropping" then "Render spreads", then swap a
+  slot's photo via a photo-picker (click a same-event candidate's thumbnail, no typing
+  filenames), lock a spread, regenerate one or all unlocked spreads, or type a
+  plain-English instruction in the chat panel.
 - **Export** — check the preflight results (resolution, missing assets), then click Export:
   a native Save As dialog lets you name the PDF and choose where it goes. After a
   successful export, the working project database and exports folder are wiped
   automatically so the next project starts clean — your source photos are never touched.
+
+Only one stage can run at a time; if a Start button is disabled, another stage is already
+running (its badge and log are visible on whichever screen it belongs to — Pause stops it).
 
 ## Project structure
 
@@ -236,7 +249,7 @@ continue without going back to Setup.
 src/                   All application code (stdlib http.server web app + pipeline stages)
   app.py                Single entry point / reverse proxy (start here)
   web_theme.py           Shared design system for the web UI
-  project_app.py         Dashboard: pipeline runner
+  project_app.py         Setup screen + shared per-stage controls widget used by every screen
   label_people_app.py    People screen
   reorder_spreads_app.py Storyboard screen
   spread_editor_app.py   Spread Editor screen + conversational editing

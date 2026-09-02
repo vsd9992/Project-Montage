@@ -124,11 +124,16 @@ def make_router(engine_state: dict):
 def run(db_path: str, exports_dir: str, source_dir: str, spreads_path: str, crops_path: str,
         rendered_dir: str, out_pdf: str, size: str, style: str, port: int, open_browser: bool = True) -> None:
     engine_state: dict = {"state": "idle"}
-    # Shared with project_app's Dashboard screen: the print size chosen there (hard-gated
-    # before the pipeline can run, since page ratio drives spread layout) is what the
+    # Shared with project_app's Setup screen: the print size chosen there (hard-gated
+    # before crop/render can run, since page ratio drives spread layout) is what the
     # editor/export screens must render/export at too -- a dict so later screens see
     # whatever the user picked, not whatever --size this process happened to start with.
+    # Seeded from exports/ui_state.json when present so a resumed project keeps rendering
+    # at the size it was rendered at across app restarts (2026-09-02 fix -- previously a
+    # restart silently reset to this CLI default, causing export's preflight to reject
+    # spreads rendered at a different size/orientation before the restart).
     project_state: dict = {"source_dir": source_dir, "size": size, "orientation": "landscape"}
+    project_state.update(project_app._load_ui_state(exports_dir))
 
     dashboard = ThreadingHTTPServer(
         ("127.0.0.1", _PORT_DASHBOARD),
