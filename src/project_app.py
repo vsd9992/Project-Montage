@@ -122,36 +122,6 @@ def _project_status(db_path: str, exports_dir: str) -> dict:
     return status
 
 
-# --- UI state persistence (2026-09-02 fix) --------------------------------------------
-# Size/orientation previously lived only in the in-memory `state` dict, reset to the CLI
-# default on every app restart. That caused two user-reported bugs: (1) export's preflight
-# comparing against a fresh-default geometry that didn't match spreads actually rendered at
-# a different size/orientation before a restart, and (2) no way to tell "this is a resumed
-# project" from "this is a fresh one". Persisting the last-chosen size/orientation next to
-# the project's own exports dir (and clearing it on wipe) fixes both: a resumed project
-# keeps rendering at the size it was rendered at, and a wiped/fresh project has nothing to
-# resume, so it defaults cleanly.
-def _ui_state_path(exports_dir: str) -> Path:
-    return Path(exports_dir) / "ui_state.json"
-
-
-def _load_ui_state(exports_dir: str) -> dict:
-    p = _ui_state_path(exports_dir)
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_ui_state(exports_dir: str, state: dict) -> None:
-    p = _ui_state_path(exports_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"size": state.get("size", ""), "orientation": state.get("orientation", "landscape")}),
-                 encoding="utf-8")
-
-
 def _build_args(stage: dict, db_path: str, exports_dir: str, source_dir: str, size: str, orientation: str) -> list[str]:
     args = []
     if stage.get("needs_source_dir"):
@@ -581,7 +551,6 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                     _group_state["stop_requested"] = False
                 state["size"] = ""
                 state["orientation"] = "landscape"
-                _save_ui_state(exports_dir, state)
                 self._accept()
                 return
 
@@ -597,7 +566,6 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 if value and value not in PRINT_SIZES:
                     self.send_response(400); self.end_headers(); return
                 state["size"] = value
-                _save_ui_state(exports_dir, state)
                 self._accept()
                 return
 
@@ -607,7 +575,6 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
                 if value not in ORIENTATIONS:
                     self.send_response(400); self.end_headers(); return
                 state["orientation"] = value
-                _save_ui_state(exports_dir, state)
                 self._accept()
                 return
 
@@ -640,8 +607,10 @@ def make_handler(db_path: str, exports_dir: str, state: dict):
 
 
 def run(db_path: str, exports_dir: str, source_dir: str, port: int) -> None:
+    # Every launch starts fresh -- see the matching wipe in app.py's run() for the full
+    # rationale (2026-09-02 user request).
+    _wipe_project(db_path, exports_dir)
     state = {"source_dir": source_dir, "size": "", "orientation": "landscape"}
-    state.update(_load_ui_state(exports_dir))
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(db_path, exports_dir, state))
     print(f"Serving project pipeline UI at http://127.0.0.1:{port}/  (db: {db_path})")
     try:

@@ -207,14 +207,16 @@ def make_handler(rendered_dir: str, spreads_path: str, db_path: str, exports_dir
                     # the working project data (DB + exports/ folder: spreads.json,
                     # crops.json, rendered_spreads/) so the next project starts fresh, per
                     # user request (2026-09-01). Source photos are never touched -- this only
-                    # ever deletes db_path and exports_dir.
-                    from project_app import _chain_lock, _chain_state, _wipe_project
-                    _wipe_project(db_path, exports_dir)
-                    with _chain_lock:
-                        _chain_state["current_index"] = 0
-                        _chain_state["finished"] = False
-                        _chain_state["failed_key"] = None
-                        _chain_state["checkpoint_key"] = None
+                    # ever deletes db_path and exports_dir. (2026-09-02: this used to reset
+                    # project_app's old chain-checkpoint state, which no longer exists after
+                    # the per-step-controls rework -- that stale import was raising and
+                    # silently skipping the wipe/reset below, even though the PDF itself had
+                    # already been written by this point.)
+                    import project_app
+                    project_app._wipe_project(db_path, exports_dir)
+                    if isinstance(size, dict):
+                        size["size"] = ""
+                        size["orientation"] = "landscape"
                     resp = {"ok": True, "pages": len(results), "out": out_pdf}
                 except Exception as e:
                     resp = {"ok": False, "error": str(e)}
